@@ -103,6 +103,7 @@ source "{pyrate_home}/pyrate_venv/bin/activate"
 
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
+    uap_home = Path(os.environ.get("UAP_HOME", str(repo_root))).resolve()
 
     default_pyrate_home = Path(
         os.environ.get(
@@ -122,7 +123,7 @@ def main() -> None:
     default_pyrate_cmd = Path(
         os.environ.get("PYRATE_CMD", str(default_pyrate_home / "pyrate_venv/bin/pyrate"))
     ).resolve()
-    default_scheduler_log_dir = (repo_root / "logs" / "scheduler").resolve()
+    default_scheduler_log_dir = (uap_home / "logs" / "scheduler").resolve()
 
     ap = argparse.ArgumentParser(description="Submit AUS pyrate point-jobs to cluster with active-job cap.")
     ap.add_argument("--raw-dir", required=True, help="Folder containing wave*_theta*_phi*.txt")

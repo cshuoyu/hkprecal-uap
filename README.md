@@ -44,6 +44,6 @@ python3 /disk03/usr8/schen/workspace/HKPrecal/hkprecal-uap/runners/aus_cluster_r
   --max-active-jobs 100
 ```
 
-Scheduler `stdout/stderr` are fixed under:
+Scheduler `stdout/stderr` default to:
 
-`/disk03/usr8/schen/workspace/HKPrecal/hkprecal-uap/logs/scheduler/<scan>/<pmt>/`
+`${UAP_HOME}/logs/scheduler/<scan>/<pmt>/`
