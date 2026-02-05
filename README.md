@@ -111,3 +111,48 @@ ${PYRATE_HOME}/pyrate_venv/bin/python /disk03/usr8/schen/workspace/HKPrecal/hkpr
   --logy \
   --out aus_tree_ch0_pulsecharge.png
 ```
+
+## Analysis I/O Interface
+
+Unified ROOT variable reader for fitting input:
+
+```python
+from analysis.root_io import read_tree_observable, read_features
+
+# AUS: canonical observable name -> branch mapping
+r = read_tree_observable(
+    "/path/to/output_theta0_phi0.root",
+    channel=0,
+    observable="charge",   # -> PulseCharge
+    system="aus",
+)
+print(r.valid_count, r.values[:5])
+
+# KOR: read multiple observables for one channel
+features = read_features(
+    "/path/to/prd_xxx.root",
+    channel=1,
+    observables=["charge", "pulse_height"],
+    system="kor",
+    source="tree",
+)
+```
+
+## Charge Fit Test (2 Gaussian)
+
+Pipeline test module: read charge -> fit 2-Gaussian -> output PNG + JSON.
+
+```bash
+python3 /disk03/usr8/schen/workspace/HKPrecal/hkprecal-uap/analysis/charge_fit_test.py \
+  --file /disk03/usr8/schen/workspace/HKPrecal/datastorage/aus/root/cluster_run_20260203_EL1365B/scan_20260203_215759/EL1365-B/outputs/output_theta0_phi0.root \
+  --system aus \
+  --channel 0 \
+  --source tree \
+  --observable charge \
+  --xmin -10 \
+  --xmax 15 \
+  --bins 300 \
+  --logy \
+  --out-dir /tmp \
+  --tag aus_theta0_phi0_ch0
+```
