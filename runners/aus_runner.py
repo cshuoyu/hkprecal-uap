@@ -4,6 +4,8 @@ AUS runner: execute pyrate over wave*.txt points under existing datastorage layo
 
 Expected raw layout example:
   datastorage/aus/raw/scan_YYYYMMDD_HHMMSS/ELxxxx-B/wave0_theta0_phi0.txt
+or:
+  datastorage/aus/raw/scan_YYYYMMDD_HHMMSS/ELxxxx-B/wave0save_theta0_phi0.txt
 """
 
 import argparse
@@ -19,7 +21,10 @@ from typing import Dict, List, Optional, Tuple
 import yaml
 
 
-POINT_RE = re.compile(r"^wave(?P<ch>\d+)_theta(?P<theta>-?\d+)_phi(?P<phi>-?\d+)\.txt$")
+# Support both naming styles:
+#   wave0_theta10_phi90.txt
+#   wave0save_theta10_phi90.txt
+POINT_RE = re.compile(r"^wave(?P<ch>\d+)(?:save)?_theta(?P<theta>-?\d+)_phi(?P<phi>-?\d+)\.txt$")
 
 
 def parse_channels(text: str) -> List[int]:
