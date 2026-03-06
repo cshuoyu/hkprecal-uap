@@ -14,7 +14,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UAP_HOME="${SCRIPT_DIR}"
-HKPRECAL_HOME="$(cd "${UAP_HOME}/.." && pwd)"
 
 DEFAULT_VENV_DIR="${UAP_HOME}/.venv/hkprecal_uap_venv"
 REQ_FILE="${UAP_HOME}/requirements.txt"
@@ -24,7 +23,7 @@ PY_BIN="${PY_BIN:-python3.8}"
 PRINT_ONLY=0
 
 # Default pyrate location for this repository layout.
-PYRATE_HOME="${PYRATE_HOME:-${HKPRECAL_HOME}/waveformreader/aus_pyrate/darkmatteraustralia-pyrate-3c2e05d64b61}"
+PYRATE_HOME="${PYRATE_HOME:-$/disk03/usr8/schen/workspace/HKPrecal/waveformreader/aus_pyrate/darkmatteraustralia-pyrate-3c2e05d64b61}"
 
 usage() {
   cat <<'EOF'

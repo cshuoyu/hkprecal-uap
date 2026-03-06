@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 *.root
 *.txt
+!requirements.txt
 *.png
 datastorage/
 logs/
