@@ -1,0 +1,154 @@
+# @package _global_
+# Plot config.
+
+# -----------------------------------------------------------------------------
+# Hydra configuration.
+# -----------------------------------------------------------------------------
+hydra:
+  run:
+    # Output dir directory.
+    dir: ${oc.env:UAP_HOME,.}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-csv2plot
+  job:
+    # If true, Hydra changes cwd to hydra.run.dir before execution.
+    chdir: true
+
+# -----------------------------------------------------------------------------
+# Global figure options.
+# -----------------------------------------------------------------------------
+# X-axis title.
+x_label: Position angle (deg)
+# Y-axis title.
+y_label: Relative QE
+# Figure title.
+title: EL1635B relative QE (B field on)
+# Axis range controls. Use null for auto-range.
+x_min: null
+x_max: null
+y_min: null
+y_max: null
+# Horizontal reference line value.
+hline: 1.0
+# Output figure filename.
+out_name: aus_kor_rel_QE.png
+# Optional exported points CSV filename.
+points_csv: aus_kor_rel_QE_points.csv
+
+# -----------------------------------------------------------------------------
+# Overlay line configuration.
+# -----------------------------------------------------------------------------
+# mode options:
+# - phi_pair: signed-theta line from two phis
+#   (x=+|theta| for phi_pos, x=-|theta| for phi_neg)
+# - single_phi: one-phi line with optional flip_sign
+#   (for KOR Hamamatsu mapping use-cases)
+# Drawing order of named lines below.
+line_order: [aus_x_20260204, kor_x_20260129, aus_y_20260204, kor_y_20260129]
+
+lines:
+  aus_x_20260204:
+    # Source system label for this line.
+    system: aus
+    # Input CSV for this line.
+    csv: /path/to/your/aus_results.csv
+    # Legend label.
+    label: AUS. 20260204 EL1635B X axis
+    # Line construction mode.
+    mode: phi_pair
+    # Column mapping.
+    phi_col: phi
+    theta_col: theta
+    y_col: relative_norm
+    yerr_col: relative_norm_err
+    # phi_pair settings.
+    phi_pos: 270
+    phi_neg: 90
+    center_phi: 0
+    center_theta: 0
+    use_hamamatsu_angle: true
+    # Visual style.
+    line_color: C0
+    marker: o
+    line_style: "-"
+    line_width: 1.5
+    marker_size: 4.8
+
+  aus_y_20260204:
+    # Source system label for this line.
+    system: aus
+    # Input CSV for this line.
+    csv: /path/to/your/aus_results.csv
+    # Legend label.
+    label: AUS. 20260204 EL1635B Y axis
+    # Line construction mode.
+    mode: phi_pair
+    # Column mapping.
+    phi_col: phi
+    theta_col: theta
+    y_col: relative_norm
+    yerr_col: relative_norm_err
+    # phi_pair settings.
+    phi_pos: 180
+    phi_neg: 0
+    center_phi: 0
+    center_theta: 0
+    use_hamamatsu_angle: true
+    # Visual style.
+    line_color: C1
+    marker: o
+    line_style: "-"
+    line_width: 1.5
+    marker_size: 4.8
+
+  kor_x_20260129:
+    # Source system label for this line.
+    system: kor
+    # Input CSV for this line.
+    csv: /path/to/your/kor_results.csv
+    # Legend label.
+    label: KOR. 20260129 EL1635B X axis
+    # Line construction mode.
+    mode: single_phi
+    # Column mapping.
+    phi_col: phi_raw
+    theta_col: theta_raw
+    y_col: relative_de
+    yerr_col: relative_de_err
+    # single_phi settings.
+    phi: 45
+    # Hamamatsu conversion knob for single-phi KOR line.
+    flip_sign: false
+    use_abs_theta: false
+    use_hamamatsu_angle: true
+    # Visual style.
+    line_color: C2
+    marker: s
+    line_style: "-"
+    line_width: 1.5
+    marker_size: 4.8
+
+  kor_y_20260129:
+    # Source system label for this line.
+    system: kor
+    # Input CSV for this line.
+    csv: /path/to/your/kor_results.csv
+    # Legend label.
+    label: KOR. 20260129 EL1635B Y axis
+    # Line construction mode.
+    mode: single_phi
+    # Column mapping.
+    phi_col: phi_raw
+    theta_col: theta_raw
+    y_col: relative_de
+    yerr_col: relative_de_err
+    # single_phi settings.
+    phi: 135
+    # Hamamatsu conversion knob for single-phi KOR line.
+    flip_sign: true
+    use_abs_theta: false
+    use_hamamatsu_angle: true
+    # Visual style.
+    line_color: C3
+    marker: s
+    line_style: "-"
+    line_width: 1.5
+    marker_size: 4.8

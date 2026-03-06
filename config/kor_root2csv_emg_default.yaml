@@ -1,0 +1,54 @@
+# @package _global_
+# Default Hydra config for root2csv (KOR).
+
+# -----------------------------------------------------------------------------
+# Hydra configuration.
+# -----------------------------------------------------------------------------
+hydra:
+  run:
+    # Output dir directory.
+    dir: ${oc.env:UAP_HOME,.}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-root2csv-${system}
+  job:
+    # If true, Hydra changes cwd to hydra.run.dir before execution.
+    chdir: true
+
+# -----------------------------------------------------------------------------
+# Input dataset.
+# -----------------------------------------------------------------------------
+# Analysis target system name (aus/kor)
+system: kor
+# Directory of KOR ROOT files to process.
+input_dir: /path/to/your/kor/root/outputs
+# PMT serial number.
+serial: EL1635B
+
+# -----------------------------------------------------------------------------
+# Fit configuration.
+# -----------------------------------------------------------------------------
+# Fit method name. (fitandplot_emg)
+fit_method: fitandplot_emg
+# Max number of input ROOT files to process. If 0, process all files.
+max_files: 0
+
+# -----------------------------------------------------------------------------
+# Channel configuration
+# -----------------------------------------------------------------------------
+# channel / trigger_ch:
+# - integer: force explicit channel.
+# - "auto": use defaults. (first/second/third PMT -> ch 0/1/3).
+channel: auto
+trigger_ch: auto
+
+# -----------------------------------------------------------------------------
+# Timing window search (unit: ns)
+# -----------------------------------------------------------------------------
+# Search hint range for PMT timing peak finding.
+# Final fit window is peak-centered with half width below.
+tmin: 0
+tmax: 2048
+# Window is selected from peak +/- half_width.
+# tmin/tmax are used as peak-search range hints.
+window_half_width: 80
+# Histogram bin width used during peak search.
+# 0.0 means automatic binning.
+window_bin_width: 2.0

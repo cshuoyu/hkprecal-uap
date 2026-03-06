@@ -12,10 +12,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
 
 
-def discover_inputs(raw_dir: Path) -> List[Path]:
+def discover_inputs(raw_dir):
     files = []
     for fp in sorted(raw_dir.glob("*.root")):
         # avoid re-processing already-produced ntuples
@@ -25,7 +24,7 @@ def discover_inputs(raw_dir: Path) -> List[Path]:
     return files
 
 
-def run_with_live_log(cmd: List[str], cwd: Path, log_path: Path, dry_run: bool) -> int:
+def run_with_live_log(cmd, cwd, log_path, dry_run):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if dry_run:
         with log_path.open("w", encoding="utf-8") as fo:
@@ -57,7 +56,7 @@ def run_with_live_log(cmd: List[str], cwd: Path, log_path: Path, dry_run: bool) 
             return proc.wait()
 
 
-def main() -> None:
+def main():
     repo_root = Path(__file__).resolve().parents[1]
     default_kor_home = Path(
         os.environ.get("KOR_NTP_HOME", str(repo_root.parent / "waveformreader" / "kor_ntp"))

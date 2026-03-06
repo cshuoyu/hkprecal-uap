@@ -1,0 +1,73 @@
+# @package _global_
+# Default Hydra config for root2csv （AUS).
+
+# -----------------------------------------------------------------------------
+# Hydra configuration.
+# -----------------------------------------------------------------------------
+hydra:
+  run:
+    # Output dir directory.
+    dir: ${oc.env:UAP_HOME,.}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-root2csv-${system}
+  job:
+    # If true, Hydra changes cwd to hydra.run.dir before execution.
+    chdir: true
+
+# -----------------------------------------------------------------------------
+# Input dataset.
+# -----------------------------------------------------------------------------
+# Analysis target system name (aus/kor)
+system: aus
+# Directory of AUS ROOT files to process.
+input_dir: /path/to/your/aus/root/outputs
+# PMT serial number.
+serial: EL1635B
+
+# -----------------------------------------------------------------------------
+# Fit configuration.
+# -----------------------------------------------------------------------------
+# Fit method name. (fitandplot_emg)
+fit_method: fitandplot_emg
+# Max number of input ROOT files to process. If 0, process all files.
+max_files: 0
+
+# -----------------------------------------------------------------------------
+# Channel configuration
+# -----------------------------------------------------------------------------
+# trigger_ch / sipm_ch / pmt_ch:
+# - integer: force explicit channel.
+# - "auto": use defaults. (trigger=0, sipm=1, pmt=2)
+trigger_ch: auto
+sipm_ch: auto
+pmt_ch: auto
+
+# -----------------------------------------------------------------------------
+# PMT timing window search (unit: ns)
+# -----------------------------------------------------------------------------
+# Search hint range for PMT timing peak finding.
+# Final fit window is peak-centered with half width below.
+tmin: 304.0
+tmax: 314.0
+# Half-width of PMT fit window around found peak.
+# Final PMT fit range: [peak - window_half_width, peak + window_half_width].
+window_half_width: 5.0
+# Histogram bin width used during peak search.
+# 0.0 means automatic binning.
+window_bin_width: 0.0
+
+# -----------------------------------------------------------------------------
+# SiPM timing window search (unit: ns)
+# -----------------------------------------------------------------------------
+# Search hint range for SiPM timing peak finding.
+sipm_tmin: 95.0
+sipm_tmax: 105.0
+# Half-width of SiPM fit window around found peak.
+sipm_window_half_width: 5.0
+# Histogram bin width for SiPM peak search.
+# 0.0 means automatic binning.
+sipm_window_bin_width: 0.0
+
+# -----------------------------------------------------------------------------
+# Analysis options
+# -----------------------------------------------------------------------------
+# If true, disable SiPM normalization.
+no_sipm: false

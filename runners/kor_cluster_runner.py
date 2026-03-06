@@ -11,17 +11,16 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import List, Tuple
 
 from kor_runner import discover_inputs
 
 
-def run_cmd(cmd: List[str]) -> Tuple[int, str]:
+def run_cmd(cmd):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
     return proc.returncode, proc.stdout
 
 
-def count_active_jobs(scheduler: str, status_cmd: str, user: str) -> int:
+def count_active_jobs(scheduler, status_cmd, user):
     if scheduler == "slurm":
         rc, out = run_cmd([status_cmd, "-u", user, "-h"])
         if rc != 0:
@@ -43,13 +42,13 @@ def count_active_jobs(scheduler: str, status_cmd: str, user: str) -> int:
 
 
 def submit_job(
-    scheduler: str,
-    submit_cmd: str,
-    job_name: str,
-    job_script: Path,
-    scheduler_out: Path,
-    scheduler_err: Path,
-) -> Tuple[int, str]:
+    scheduler,
+    submit_cmd,
+    job_name,
+    job_script,
+    scheduler_out,
+    scheduler_err,
+):
     if scheduler == "slurm":
         cmd = [
             submit_cmd,
@@ -76,15 +75,15 @@ def submit_job(
 
 
 def write_job_script(
-    job_script: Path,
-    root_thisroot: Path,
-    kor_home: Path,
-    root_cmd: str,
-    macro: Path,
-    input_root: Path,
-    point_log: Path,
-    out_root: Path,
-) -> None:
+    job_script,
+    root_thisroot,
+    kor_home,
+    root_cmd,
+    macro,
+    input_root,
+    point_log,
+    out_root,
+):
     out_root.parent.mkdir(parents=True, exist_ok=True)
     text = f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -110,7 +109,7 @@ mv -f "${{src}}" "{out_root}"
     job_script.chmod(0o755)
 
 
-def main() -> None:
+def main():
     repo_root = Path(__file__).resolve().parents[1]
     uap_home = Path(os.environ.get("UAP_HOME", str(repo_root))).resolve()
 

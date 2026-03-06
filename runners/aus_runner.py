@@ -16,7 +16,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import yaml
 
@@ -27,8 +26,8 @@ import yaml
 POINT_RE = re.compile(r"^wave(?P<ch>\d+)(?:save)?_theta(?P<theta>-?\d+)_phi(?P<phi>-?\d+)\.txt$")
 
 
-def parse_channels(text: str) -> List[int]:
-    out: List[int] = []
+def parse_channels(text):
+    out = []
     for tok in text.split(","):
         tok = tok.strip()
         if not tok:
@@ -39,8 +38,8 @@ def parse_channels(text: str) -> List[int]:
     return out
 
 
-def discover_points(raw_dir: Path) -> Dict[Tuple[int, int], Dict[int, Path]]:
-    points: Dict[Tuple[int, int], Dict[int, Path]] = {}
+def discover_points(raw_dir):
+    points = {}
     for fp in sorted(raw_dir.glob("wave*_theta*_phi*.txt")):
         m = POINT_RE.match(fp.name)
         if not m:
@@ -56,12 +55,12 @@ def discover_points(raw_dir: Path) -> Dict[Tuple[int, int], Dict[int, Path]]:
 
 
 def keep_requested_points(
-    points: Dict[Tuple[int, int], Dict[int, Path]],
-    requested: Optional[List[str]],
-) -> Dict[Tuple[int, int], Dict[int, Path]]:
+    points,
+    requested,
+):
     if not requested:
         return points
-    keep: Dict[Tuple[int, int], Dict[int, Path]] = {}
+    keep = {}
     for item in requested:
         m = re.match(r"^theta(-?\d+)_phi(-?\d+)$", item.strip())
         if not m:
@@ -72,7 +71,7 @@ def keep_requested_points(
     return keep
 
 
-def extract_scan_and_pmt(raw_dir: Path) -> Tuple[str, str]:
+def extract_scan_and_pmt(raw_dir):
     # .../datastorage/aus/raw/<scan>/<pmt>
     pmt = raw_dir.name
     scan = raw_dir.parent.name
@@ -80,11 +79,11 @@ def extract_scan_and_pmt(raw_dir: Path) -> Tuple[str, str]:
 
 
 def build_config_for_point(
-    template_cfg: dict,
-    channels: List[int],
-    point_files: Dict[int, Path],
-    output_root: Path,
-) -> dict:
+    template_cfg,
+    channels,
+    point_files,
+    output_root,
+):
     cfg = copy.deepcopy(template_cfg)
     cfg["<channels>"] = channels
 
@@ -115,7 +114,7 @@ def build_config_for_point(
     return cfg
 
 
-def run_pyrate(config_path: Path, pyrate_cmd: str, pyrate_cwd: Path, log_path: Path, dry_run: bool) -> int:
+def run_pyrate(config_path, pyrate_cmd, pyrate_cwd, log_path, dry_run):
     cmd = [pyrate_cmd, "-c", str(config_path)]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if dry_run:
@@ -147,7 +146,7 @@ def run_pyrate(config_path: Path, pyrate_cmd: str, pyrate_cwd: Path, log_path: P
             return proc.wait()
 
 
-def main() -> None:
+def main():
     repo_root = Path(__file__).resolve().parents[1]
     default_template_from_pyrate = None
     if os.environ.get("PYRATE_HOME"):

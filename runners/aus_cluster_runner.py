@@ -11,7 +11,6 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import List, Tuple
 
 import yaml
 
@@ -24,12 +23,12 @@ from aus_runner import (
 )
 
 
-def run_cmd(cmd: List[str]) -> Tuple[int, str]:
+def run_cmd(cmd):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
     return proc.returncode, proc.stdout
 
 
-def count_active_jobs(scheduler: str, status_cmd: str, user: str) -> int:
+def count_active_jobs(scheduler, status_cmd, user):
     if scheduler == "slurm":
         rc, out = run_cmd([status_cmd, "-u", user, "-h"])
         if rc != 0:
@@ -51,13 +50,13 @@ def count_active_jobs(scheduler: str, status_cmd: str, user: str) -> int:
 
 
 def submit_job(
-    scheduler: str,
-    submit_cmd: str,
-    job_name: str,
-    job_script: Path,
-    scheduler_out: Path,
-    scheduler_err: Path,
-) -> Tuple[int, str]:
+    scheduler,
+    submit_cmd,
+    job_name,
+    job_script,
+    scheduler_out,
+    scheduler_err,
+):
     if scheduler == "slurm":
         cmd = [
             submit_cmd,
@@ -84,13 +83,13 @@ def submit_job(
 
 
 def write_job_script(
-    job_script: Path,
-    root_thisroot: Path,
-    pyrate_home: Path,
-    pyrate_cmd: Path,
-    config_path: Path,
-    log_path: Path,
-) -> None:
+    job_script,
+    root_thisroot,
+    pyrate_home,
+    pyrate_cmd,
+    config_path,
+    log_path,
+):
     text = f"""#!/usr/bin/env bash
 set -euo pipefail
 source "{root_thisroot}"
@@ -101,7 +100,7 @@ source "{pyrate_home}/pyrate_venv/bin/activate"
     job_script.chmod(0o755)
 
 
-def main() -> None:
+def main():
     repo_root = Path(__file__).resolve().parents[1]
     uap_home = Path(os.environ.get("UAP_HOME", str(repo_root))).resolve()
 
