@@ -111,7 +111,7 @@ def main():
         )
     ).resolve()
     default_template = Path(
-        os.environ.get("UAP_AUS_TEMPLATE", str(default_pyrate_home.parent / "R12860_config.yaml"))
+        os.environ.get("UAP_AUS_TEMPLATE", str(default_pyrate_home.parent / "R12860_config_2.yaml"))
     ).resolve()
     default_root_thisroot = Path(
         os.environ.get(
@@ -214,7 +214,7 @@ def main():
             continue
 
         out_root = out_root_dir / f"output_{point_tag}.root"
-        cfg_path = cfg_dir / f"R12860_{point_tag}.yaml"
+        cfg_path = cfg_dir / f"R12860_{point_tag}_2.yaml"
         log_path = log_dir / f"{point_tag}.log"
         scheduler_out = scheduler_dir / f"{point_tag}.out"
         scheduler_err = scheduler_dir / f"{point_tag}.err"
