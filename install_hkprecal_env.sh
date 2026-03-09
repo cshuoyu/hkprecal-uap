@@ -23,7 +23,7 @@ PY_BIN="${PY_BIN:-python3.8}"
 PRINT_ONLY=0
 
 # Default pyrate location for this repository layout.
-PYRATE_HOME="${PYRATE_HOME:-$/disk03/usr8/schen/workspace/HKPrecal/waveformreader/aus_pyrate/darkmatteraustralia-pyrate-3c2e05d64b61}"
+PYRATE_HOME="${PYRATE_HOME:-/disk03/usr8/schen/workspace/HKPrecal/waveformreader/aus_pyrate/darkmatteraustralia-pyrate-3c2e05d64b61}"
 
 usage() {
   cat <<'EOF'
