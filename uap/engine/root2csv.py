@@ -5,10 +5,26 @@ import argparse
 import logging
 from pathlib import Path
 
+from uap.fit.charge_spectrum_fit import CHARGE_METHOD_NAME, ChargeSpectrumFitter
 from uap.fit.emg_timing_offset_fit import TimingEMGFitter
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_charge_method(method_name):
+    return str(method_name or "").strip() == CHARGE_METHOD_NAME
+
+
+def _add_charge_args(parser):
+    parser.add_argument("--charge-branch", default="auto")
+    parser.add_argument(
+        "--charge-fit-range",
+        nargs=2,
+        type=float,
+        metavar=("QMIN", "QMAX"),
+        default=None,
+    )
 
 
 def build_fitter(args, out_csv_path):
@@ -18,10 +34,22 @@ def build_fitter(args, out_csv_path):
         if fig_dir_arg
         else Path(out_csv_path).resolve().parent / "figures"
     )
-    return TimingEMGFitter(
-        method_name=args.fit_method,
-        fig_dir=fig_dir,
-    )
+    if _is_charge_method(args.fit_method):
+        qmin, qmax = (None, None)
+        fit_range = getattr(args, "charge_fit_range", None)
+        if fit_range:
+            qmin, qmax = [float(x) for x in fit_range]
+        return ChargeSpectrumFitter(
+            method_name=CHARGE_METHOD_NAME,
+            fig_dir=fig_dir,
+            inc_backscatter=bool(
+                getattr(args, "inc_backscatter", getattr(args, "inc_bkg", True))
+            ),
+            charge_branch=getattr(args, "charge_branch", "auto"),
+            charge_qmin=qmin,
+            charge_qmax=qmax,
+        )
+    return TimingEMGFitter(method_name=args.fit_method, fig_dir=fig_dir)
 
 
 def build_parser():
@@ -33,8 +61,9 @@ def build_parser():
     ap_aus.add_argument("--out-csv", default="", help="Output fit CSV path")
     ap_aus.add_argument("--out-base", default="", help="Run output root (default: <UAP_HOME>/outputs)")
     ap_aus.add_argument("--serial", default="")
-    ap_aus.add_argument("--fit-method", default="fitandplot_emg", help="Timing fitter method")
+    ap_aus.add_argument("--fit-method", default="fitandplot_emg", help="Fit method")
     ap_aus.add_argument("--fig-dir", default="", help="Directory to store diagnostic fit figures")
+    _add_charge_args(ap_aus)
     ap_aus.add_argument("--pmt-ch", default="auto")
     ap_aus.add_argument("--trigger-ch", default="auto")
     ap_aus.add_argument("--laser-ch", default=None, help="Deprecated alias of --trigger-ch")
@@ -60,8 +89,9 @@ def build_parser():
     ap_kor.add_argument("--serial", default="AA0000A")
     ap_kor.add_argument("--channel", default="auto")
     ap_kor.add_argument("--trigger-ch", default="auto")
-    ap_kor.add_argument("--fit-method", default="fitandplot_emg", help="Timing fitter method")
+    ap_kor.add_argument("--fit-method", default="fitandplot_emg", help="Fit method")
     ap_kor.add_argument("--fig-dir", default="", help="Directory to store diagnostic fit figures")
+    _add_charge_args(ap_kor)
     ap_kor.add_argument("--inc-bkg", dest="inc_bkg", action="store_true")
     ap_kor.add_argument("--no-inc-bkg", dest="inc_bkg", action="store_false")
     ap_kor.set_defaults(inc_bkg=True)
@@ -89,10 +119,13 @@ def _prepare_output_layout(args):
 
     out_base = Path(out_base_arg).resolve() if out_base_arg else None
     if not out_csv_arg:
+        stem = "{}_results.csv".format(args.system)
+        if _is_charge_method(getattr(args, "fit_method", "")):
+            stem = "{}_charge_results.csv".format(args.system)
         if out_base:
-            out_csv_arg = str(out_base / "csv" / "{}_results.csv".format(args.system))
+            out_csv_arg = str(out_base / "csv" / stem)
         else:
-            out_csv_arg = str(Path("csv") / "{}_results.csv".format(args.system))
+            out_csv_arg = str(Path("csv") / stem)
     if not fig_dir_arg:
         if out_base:
             fig_dir_arg = str(out_base / "figures")
