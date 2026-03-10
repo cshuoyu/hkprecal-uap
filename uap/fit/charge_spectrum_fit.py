@@ -11,11 +11,6 @@ import os
 import re
 import warnings
 from pathlib import Path
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("ZFIT_DISABLE_TF_WARNINGS", "1")
-
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -23,17 +18,9 @@ import tensorflow
 import zfit
 from zfit import z
 
-from .common_math import safe_ratio, safe_ratio_err
-from .fitter_interface import BaseScanFitter
-from .plot_utils import save_fit_with_pull_plot
-from uap.scan_reader.kor_reader import (
-    auto_pick_channel,
-    auto_pick_trigger_channel,
-    check_serial_order_consistency,
-    extract_serial_block_angles,
-    read_tree_branch,
-)
-from uap.tool.scan_prepare import resolve_kor_channels
+from . import common_math, fitter_interface, plot_utils
+from uap.scan_reader import kor_reader
+from uap.tool import scan_prepare
 
 
 logger = logging.getLogger(__name__)
@@ -62,7 +49,9 @@ class KORBackscatterPDF(zfit.pdf.BasePDF):
             "mu_spe": mu_spe,
             "sigma_spe": sigma_spe,
         }
-        super().__init__(obs=obs, params=params, extended=extended, norm=norm, name=name)
+        super().__init__(
+            obs=obs, params=params, extended=extended, norm=norm, name=name
+        )
 
     def _unnormalized_pdf(self, x):
         x = z.unstack_x(x)
@@ -85,7 +74,7 @@ E_CHARGE_PC = 1.602176634e-7
 CHARGE_METHOD_NAME = "fitandplot_kor_charge"
 
 
-class ChargeSpectrumFitter(BaseScanFitter):
+class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
     FIT_FIELD_MAP = [
         ("ped_mean", "ped_mean"),
         ("ped_mean_err", "ped_mean_err"),
@@ -258,7 +247,9 @@ class ChargeSpectrumFitter(BaseScanFitter):
         ped_arr = self._clip_to_range(data_np, ped_min, ped_max)
         if ped_arr.size == 0:
             ped_arr = self._clip_to_range(data_np, xmin, xmin + 0.35 * span)
-        mu_ped = self._hist_peak(ped_arr, ped_min, ped_max, nbins=max(self.nbins * 2, 80))
+        mu_ped = self._hist_peak(
+            ped_arr, ped_min, ped_max, nbins=max(self.nbins * 2, 80)
+        )
         if not np.isfinite(mu_ped):
             mu_ped = float(np.nanmedian(ped_arr)) if ped_arr.size > 0 else 0.0
         sigma_ped = float(np.nanstd(ped_arr)) if ped_arr.size > 2 else np.nan
@@ -268,9 +259,15 @@ class ChargeSpectrumFitter(BaseScanFitter):
         spe_arr = self._clip_to_range(data_np, spe_min, spe_max)
         if spe_arr.size == 0:
             spe_arr = self._clip_to_range(data_np, mu_ped + 0.15 * span, xmax)
-        mu_spe = self._hist_peak(spe_arr, spe_min, spe_max, nbins=max(self.nbins * 2, 80))
+        mu_spe = self._hist_peak(
+            spe_arr, spe_min, spe_max, nbins=max(self.nbins * 2, 80)
+        )
         if not np.isfinite(mu_spe):
-            mu_spe = float(np.nanmedian(spe_arr)) if spe_arr.size > 0 else mu_ped + 0.5 * span
+            mu_spe = (
+                float(np.nanmedian(spe_arr))
+                if spe_arr.size > 0
+                else mu_ped + 0.5 * span
+            )
         sigma_spe = float(np.nanstd(spe_arr)) if spe_arr.size > 2 else np.nan
         if not np.isfinite(sigma_spe) or sigma_spe <= 0:
             sigma_spe = max(0.05 * span, 0.12)
@@ -283,7 +280,9 @@ class ChargeSpectrumFitter(BaseScanFitter):
         }
 
     def _compute_peak_to_valley(self, values, xr, mu_ped, mu_spe):
-        counts, centers, _ = self._histogram(values, xr[0], xr[1], max(self.nbins * 2, 80))
+        counts, centers, _ = self._histogram(
+            values, xr[0], xr[1], max(self.nbins * 2, 80)
+        )
         if counts.size == 0:
             return np.nan
         left = min(float(mu_ped), float(mu_spe))
@@ -364,7 +363,7 @@ class ChargeSpectrumFitter(BaseScanFitter):
 
         name = (plotname or "kor_charge_fit").strip()
         target = self.fig_dir / "{}.png".format(name)
-        save_fit_with_pull_plot(
+        plot_utils.save_fit_with_pull_plot(
             plt=plt,
             out_png=target,
             centers=centers,
@@ -579,15 +578,15 @@ class ChargeSpectrumFitter(BaseScanFitter):
                 ).values
                 n_err = int(np.sum(np.isfinite(g0_err_vals)))
                 g0_err = (
-                    float(np.sqrt(np.nansum(g0_err_vals ** 2)) / n_err)
+                    float(np.sqrt(np.nansum(g0_err_vals**2)) / n_err)
                     if n_err > 0
                     else np.nan
                 )
 
-            out_df.loc[idx, "relative_gain"] = safe_ratio(
+            out_df.loc[idx, "relative_gain"] = common_math.safe_ratio(
                 out_df.loc[idx, "gain"].values, g0, logger=logger
             )
-            out_df.loc[idx, "relative_gain_err"] = safe_ratio_err(
+            out_df.loc[idx, "relative_gain_err"] = common_math.safe_ratio_err(
                 out_df.loc[idx, "gain"].values,
                 out_df.loc[idx, "gain_err"].values,
                 g0,
@@ -611,7 +610,7 @@ class ChargeSpectrumFitter(BaseScanFitter):
 
         selected = []
         for fp in files:
-            parsed = extract_serial_block_angles(fp.name, args.serial)
+            parsed = kor_reader.extract_serial_block_angles(fp.name, args.serial)
             if parsed is None:
                 continue
             phi, theta_raw = parsed
@@ -621,7 +620,9 @@ class ChargeSpectrumFitter(BaseScanFitter):
             raise SystemExit("No files matched serial={}.".format(args.serial))
 
         files_for_auto = [x[0] for x in selected]
-        ref_order, mismatches = check_serial_order_consistency(files_for_auto)
+        ref_order, mismatches = kor_reader.check_serial_order_consistency(
+            files_for_auto
+        )
         if mismatches:
             logger.warning(
                 "[WARN] serial order mismatch across files. reference=%s mismatched=%s first=%s",
@@ -630,12 +631,12 @@ class ChargeSpectrumFitter(BaseScanFitter):
                 mismatches[0][0],
             )
 
-        ctx = resolve_kor_channels(
+        ctx = scan_prepare.resolve_kor_channels(
             args=args,
             files_for_auto=files_for_auto,
             parse_auto_or_int_fn=self.parse_auto_or_int,
-            auto_pick_trigger_channel_fn=auto_pick_trigger_channel,
-            auto_pick_channel_fn=auto_pick_channel,
+            auto_pick_trigger_channel_fn=kor_reader.auto_pick_trigger_channel,
+            auto_pick_channel_fn=kor_reader.auto_pick_channel,
         )
 
         self.log_channel_config(
@@ -663,7 +664,7 @@ class ChargeSpectrumFitter(BaseScanFitter):
 
         for idx, (fp, phi, theta_raw) in enumerate(selected):
             charge = self.run_step(
-                lambda: read_tree_branch(fp, ctx["channel"], charge_branch),
+                lambda: kor_reader.read_tree_branch(fp, ctx["channel"], charge_branch),
                 stats=prep_stats,
                 fail_key="charge_read_fail",
                 file_name=fp.name,
@@ -717,7 +718,13 @@ class ChargeSpectrumFitter(BaseScanFitter):
                     row=row,
                     main_fit_input=self.make_fit_input(
                         data=fit_values,
-                        coord=("kor_charge", args.serial, int(phi), int(theta_raw), idx),
+                        coord=(
+                            "kor_charge",
+                            args.serial,
+                            int(phi),
+                            int(theta_raw),
+                            idx,
+                        ),
                         plotname="kor_charge_{}_phi{}_theta{}_{}".format(
                             args.serial, phi, theta_raw, idx
                         ),

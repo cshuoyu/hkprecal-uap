@@ -12,31 +12,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .fitter_interface import BaseScanFitter
-from .common_math import safe_ratio, safe_ratio_err
-from .plot_utils import save_fit_with_pull_plot
-from uap.scan_reader.aus_reader import (
-    DEFAULT_AUS_CHANNELS,
-    load_branch,
-    parse_theta_phi_aus,
-    resolve_aus_channel,
-)
-from uap.scan_reader.kor_reader import (
-    auto_pick_channel,
-    auto_pick_trigger_channel,
-    check_serial_order_consistency,
-    extract_serial_block_angles,
-    read_tree_branch,
-)
-from uap.tool.scan_prepare import (
-    build_aus_row,
-    build_kor_row,
-    init_aus_prep_stats,
-    init_kor_prep_stats,
-    resolve_aus_context,
-    resolve_kor_channels,
-)
-from uap.tool.window import select_window
+from . import common_math, fitter_interface, plot_utils
+from uap.scan_reader import aus_reader, kor_reader
+from uap.tool import scan_prepare, window
 
 
 logger = logging.getLogger(__name__)
@@ -49,27 +27,11 @@ _RUNTIME_READY = False
 SAMPLE_NS = 2.0
 
 
-# Keep third-party runtime output quiet by default.
-def _configure_runtime_verbosity():
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    os.environ.setdefault("ZFIT_DISABLE_TF_WARNINGS", "1")
-    warnings.filterwarnings(
-        "ignore", category=FutureWarning, module=r"google\.api_core\..*"
-    )
-    warnings.filterwarnings(
-        "ignore", category=FutureWarning, module=r"google\.auth(\..*)?$"
-    )
-    warnings.filterwarnings(
-        "ignore", category=FutureWarning, module=r"google\.oauth2(\..*)?$"
-    )
-
-
 # Load heavy deps (zfit/tensorflow/matplotlib).
 def _ensure_runtime():
     global plt, tensorflow, zfit, z, UAPEMG, _RUNTIME_READY
     if _RUNTIME_READY:
         return
-    _configure_runtime_verbosity()
     try:
         import matplotlib.pyplot as _plt
         import tensorflow as _tensorflow
@@ -89,9 +51,9 @@ def _ensure_runtime():
         zfit.settings.changed_warnings.hesse_name = False
     except Exception:
         pass
+
     # EMG PDF used for timing fit.
     class _UAPEMG(zfit.pdf.BasePDF):
-
         def __init__(self, obs, mu, lambd, sigma, extended=None, norm=None, name=None):
             params = {"mu": mu, "lambd": lambd, "sigma": sigma}
             super().__init__(
@@ -111,9 +73,9 @@ def _ensure_runtime():
     UAPEMG = _UAPEMG
     _RUNTIME_READY = True
 
-# Concrete fitter.
-class TimingEMGFitter(BaseScanFitter):
 
+# Concrete fitter.
+class TimingEMGFitter(fitter_interface.BaseScanFitter):
     # Store fitter options and create figure directory.
     def __init__(self, method_name="fitandplot_emg", fig_dir=None, nbins=30):
         _ensure_runtime()
@@ -185,7 +147,9 @@ class TimingEMGFitter(BaseScanFitter):
                 roots.append(float(x1 - y1 * (x2 - x1) / (y2 - y1)))
 
             if len(roots) < 2:
-                logger.warning("[FWHM][WARN] insufficient half-maximum crossings, return NaN.")
+                logger.warning(
+                    "[FWHM][WARN] insufficient half-maximum crossings, return NaN."
+                )
                 return np.nan
 
             roots = np.asarray(roots, dtype=float)
@@ -199,7 +163,11 @@ class TimingEMGFitter(BaseScanFitter):
                 r2 = float(roots[-1])
             return abs(r2 - r1)
         except Exception as exc:
-            logger.warning("[FWHM][WARN] computation failed: %s: %s. return NaN.", type(exc).__name__, exc)
+            logger.warning(
+                "[FWHM][WARN] computation failed: %s: %s. return NaN.",
+                type(exc).__name__,
+                exc,
+            )
             return np.nan
 
     # Save one diagnostic fit plot (data/model + pull).
@@ -237,7 +205,7 @@ class TimingEMGFitter(BaseScanFitter):
 
         name = (plotname or "fit").strip()
         target = self.fig_dir / "{}.png".format(name)
-        save_fit_with_pull_plot(
+        plot_utils.save_fit_with_pull_plot(
             plt=plt,
             out_png=target,
             centers=centers,
@@ -391,8 +359,10 @@ class TimingEMGFitter(BaseScanFitter):
         sig0 = float(center_row.get("sig_yield", np.nan))
         sig0_err = float(center_row.get("sig_err", np.nan))
 
-        out_df["rel_yield"] = safe_ratio(out_df["sig_yield"].values, sig0, logger=logger)
-        out_df["rel_yield_err"] = safe_ratio_err(
+        out_df["rel_yield"] = common_math.safe_ratio(
+            out_df["sig_yield"].values, sig0, logger=logger
+        )
+        out_df["rel_yield_err"] = common_math.safe_ratio_err(
             out_df["sig_yield"].values,
             out_df["sig_err"].values,
             sig0,
@@ -404,10 +374,10 @@ class TimingEMGFitter(BaseScanFitter):
             sipm0 = float(center_row.get("sipm_sig_yield", np.nan))
             sipm0_err = float(center_row.get("sipm_sig_err", np.nan))
 
-            out_df["rel_sipm_yield"] = safe_ratio(
+            out_df["rel_sipm_yield"] = common_math.safe_ratio(
                 out_df["sipm_sig_yield"].values, sipm0, logger=logger
             )
-            out_df["rel_sipm_yield_err"] = safe_ratio_err(
+            out_df["rel_sipm_yield_err"] = common_math.safe_ratio_err(
                 out_df["sipm_sig_yield"].values,
                 out_df["sipm_sig_err"].values,
                 sipm0,
@@ -415,22 +385,27 @@ class TimingEMGFitter(BaseScanFitter):
                 logger=logger,
             )
 
-            point_ratio = safe_ratio(
-                out_df["sig_yield"].values, out_df["sipm_sig_yield"].values
-                , logger=logger
+            point_ratio = common_math.safe_ratio(
+                out_df["sig_yield"].values,
+                out_df["sipm_sig_yield"].values,
+                logger=logger,
             )
-            point_ratio_err = safe_ratio_err(
+            point_ratio_err = common_math.safe_ratio_err(
                 out_df["sig_yield"].values,
                 out_df["sig_err"].values,
                 out_df["sipm_sig_yield"].values,
                 out_df["sipm_sig_err"].values,
                 logger=logger,
             )
-            center_ratio = safe_ratio(sig0, sipm0, logger=logger)
-            center_ratio_err = safe_ratio_err(sig0, sig0_err, sipm0, sipm0_err, logger=logger)
+            center_ratio = common_math.safe_ratio(sig0, sipm0, logger=logger)
+            center_ratio_err = common_math.safe_ratio_err(
+                sig0, sig0_err, sipm0, sipm0_err, logger=logger
+            )
 
-            out_df["relative_norm"] = safe_ratio(point_ratio, center_ratio, logger=logger)
-            out_df["relative_norm_err"] = safe_ratio_err(
+            out_df["relative_norm"] = common_math.safe_ratio(
+                point_ratio, center_ratio, logger=logger
+            )
+            out_df["relative_norm_err"] = common_math.safe_ratio_err(
                 point_ratio,
                 point_ratio_err,
                 center_ratio,
@@ -466,13 +441,17 @@ class TimingEMGFitter(BaseScanFitter):
                 sig0 = float(center_row.get("sig_yield", np.nan))
                 sig0_err = float(center_row.get("sig_err", np.nan))
             else:
-                sig0_vals = pd.to_numeric(center_rows["sig_yield"], errors="coerce").values
+                sig0_vals = pd.to_numeric(
+                    center_rows["sig_yield"], errors="coerce"
+                ).values
                 sig0 = float(np.nanmean(sig0_vals))
 
-                sig0_err_vals = pd.to_numeric(center_rows["sig_err"], errors="coerce").values
+                sig0_err_vals = pd.to_numeric(
+                    center_rows["sig_err"], errors="coerce"
+                ).values
                 n_err = int(np.sum(np.isfinite(sig0_err_vals)))
                 if n_err > 0:
-                    sig0_err = float(np.sqrt(np.nansum(sig0_err_vals ** 2)) / n_err)
+                    sig0_err = float(np.sqrt(np.nansum(sig0_err_vals**2)) / n_err)
                 else:
                     sig0_err = np.nan
 
@@ -483,8 +462,10 @@ class TimingEMGFitter(BaseScanFitter):
                         len(center_rows),
                     )
 
-            rel = safe_ratio(out_df.loc[idx, "sig_yield"].values, sig0, logger=logger)
-            rel_err = safe_ratio_err(
+            rel = common_math.safe_ratio(
+                out_df.loc[idx, "sig_yield"].values, sig0, logger=logger
+            )
+            rel_err = common_math.safe_ratio_err(
                 out_df.loc[idx, "sig_yield"].values,
                 out_df.loc[idx, "sig_err"].values,
                 sig0,
@@ -524,8 +505,10 @@ class TimingEMGFitter(BaseScanFitter):
             empty_msg="No output_theta*_phi*.root found in: {}",
         )
 
-        defaults = dict(DEFAULT_AUS_CHANNELS)
-        ctx = resolve_aus_context(args, defaults, resolve_aus_channel)
+        defaults = dict(aus_reader.DEFAULT_AUS_CHANNELS)
+        ctx = scan_prepare.resolve_aus_context(
+            args, defaults, aus_reader.resolve_aus_channel
+        )
 
         self.log_channel_config(
             system="aus",
@@ -550,10 +533,10 @@ class TimingEMGFitter(BaseScanFitter):
         use_sipm = not args.no_sipm
 
         # Preparation counters for logging.
-        prep_stats = init_aus_prep_stats(len(files))
+        prep_stats = scan_prepare.init_aus_prep_stats(len(files))
         points = []
         for fp in files:
-            parsed = parse_theta_phi_aus(fp)
+            parsed = aus_reader.parse_theta_phi_aus(fp)
             if parsed is None:
                 continue
             theta, phi = parsed
@@ -561,8 +544,8 @@ class TimingEMGFitter(BaseScanFitter):
             # Read PMT/trigger timing arrays.
             read_pair = self.run_step(
                 lambda: (
-                    load_branch(fp, pmt_tree, tbranch) * SAMPLE_NS,
-                    load_branch(fp, trigger_tree, tbranch) * SAMPLE_NS,
+                    aus_reader.load_branch(fp, pmt_tree, tbranch) * SAMPLE_NS,
+                    aus_reader.load_branch(fp, trigger_tree, tbranch) * SAMPLE_NS,
                 ),
                 stats=prep_stats,
                 fail_key="pmt_read_fail",
@@ -581,7 +564,7 @@ class TimingEMGFitter(BaseScanFitter):
 
             # Select PMT fit window around peak.
             pmt_window = self.run_step(
-                lambda: select_window(
+                lambda: window.select_window(
                     values=d_all,
                     method="peak_center",
                     tmin=args.tmin,
@@ -605,7 +588,7 @@ class TimingEMGFitter(BaseScanFitter):
                 self.inc_stat(prep_stats, "pmt_empty_window")
                 continue
 
-            row = build_aus_row(
+            row = scan_prepare.build_aus_row(
                 fp_name=fp.name,
                 ctx=ctx,
                 defaults=defaults,
@@ -636,7 +619,7 @@ class TimingEMGFitter(BaseScanFitter):
                     "fit_input": None,
                 }
                 sipm_t = self.run_step(
-                    lambda: load_branch(fp, sipm_tree, tbranch) * SAMPLE_NS,
+                    lambda: aus_reader.load_branch(fp, sipm_tree, tbranch) * SAMPLE_NS,
                     stats=prep_stats,
                     fail_key="sipm_read_fail",
                     file_name=fp.name,
@@ -649,7 +632,7 @@ class TimingEMGFitter(BaseScanFitter):
                         self.inc_stat(prep_stats, "sipm_empty_window")
                     else:
                         sipm_window = self.run_step(
-                            lambda: select_window(
+                            lambda: window.select_window(
                                 values=ds_all,
                                 method="peak_center",
                                 tmin=args.sipm_tmin,
@@ -708,7 +691,7 @@ class TimingEMGFitter(BaseScanFitter):
         # Keep only files containing the requested serial block.
         selected = []
         for fp in files:
-            parsed = extract_serial_block_angles(fp.name, args.serial)
+            parsed = kor_reader.extract_serial_block_angles(fp.name, args.serial)
             if parsed is None:
                 continue
             phi, theta_raw = parsed
@@ -718,7 +701,9 @@ class TimingEMGFitter(BaseScanFitter):
             raise SystemExit("No files matched serial={}.".format(args.serial))
 
         files_for_auto = [x[0] for x in selected]
-        ref_order, mismatches = check_serial_order_consistency(files_for_auto)
+        ref_order, mismatches = kor_reader.check_serial_order_consistency(
+            files_for_auto
+        )
         if mismatches:
             logger.warning(
                 "[WARN] serial order mismatch across files. reference=%s mismatched=%s first=%s",
@@ -728,12 +713,12 @@ class TimingEMGFitter(BaseScanFitter):
             )
 
         # Resolve channel and trigger from config/auto mapping.
-        ctx = resolve_kor_channels(
+        ctx = scan_prepare.resolve_kor_channels(
             args=args,
             files_for_auto=files_for_auto,
             parse_auto_or_int_fn=self.parse_auto_or_int,
-            auto_pick_trigger_channel_fn=auto_pick_trigger_channel,
-            auto_pick_channel_fn=auto_pick_channel,
+            auto_pick_trigger_channel_fn=kor_reader.auto_pick_trigger_channel,
+            auto_pick_channel_fn=kor_reader.auto_pick_channel,
         )
 
         self.log_channel_config(
@@ -751,13 +736,15 @@ class TimingEMGFitter(BaseScanFitter):
 
         window_method = "peak_center"
         # Preparation counters for logging.
-        prep_stats = init_kor_prep_stats(len(selected))
+        prep_stats = scan_prepare.init_kor_prep_stats(len(selected))
         points = []
 
         for idx, (fp, phi, theta_raw) in enumerate(selected):
             # Read KOR diff and convert to ns.
             diff = self.run_step(
-                lambda: read_tree_branch(fp, ctx["channel"], "diff") * SAMPLE_NS,
+                lambda: (
+                    kor_reader.read_tree_branch(fp, ctx["channel"], "diff") * SAMPLE_NS
+                ),
                 stats=prep_stats,
                 fail_key="diff_read_fail",
                 file_name=fp.name,
@@ -768,7 +755,7 @@ class TimingEMGFitter(BaseScanFitter):
 
             # Select KOR fit window around peak.
             kor_window = self.run_step(
-                lambda: select_window(
+                lambda: window.select_window(
                     values=diff,
                     method=window_method,
                     tmin=args.tmin,
@@ -812,7 +799,7 @@ class TimingEMGFitter(BaseScanFitter):
                 },
             )
 
-            row = build_kor_row(
+            row = scan_prepare.build_kor_row(
                 fp_name=fp.name,
                 serial=args.serial,
                 ctx=ctx,
