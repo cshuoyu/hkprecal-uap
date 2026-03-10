@@ -88,22 +88,14 @@ def write_job_script(
     text = f"""#!/usr/bin/env bash
 set -euo pipefail
 source "{root_thisroot}"
-submit_cwd="$(pwd)"
 cd "{kor_home}"
-macro_call='{macro}("{input_root}")'
+mkdir -p "{out_root.parent}"
+macro_call='{macro}("{input_root}","{out_root}")'
 "{root_cmd}" -l -b -q "${{macro_call}}" > "{point_log}" 2>&1
-src="{kor_home / ('prd_' + input_root.name)}"
-if [[ ! -f "${{src}}" ]]; then
-  alt="${{submit_cwd}}/prd_{input_root.name}"
-  if [[ -f "${{alt}}" ]]; then
-    src="${{alt}}"
-  else
-    echo "[KOR][ERROR] expected output not found: ${{src}}" >> "{point_log}"
-    echo "[KOR][ERROR] also not found in submit cwd: ${{alt}}" >> "{point_log}"
-    exit 2
-  fi
+if [[ ! -f "{out_root}" ]]; then
+  echo "[KOR][ERROR] expected output not found: {out_root}" >> "{point_log}"
+  exit 2
 fi
-mv -f "${{src}}" "{out_root}"
 """
     job_script.write_text(text, encoding="utf-8")
     job_script.chmod(0o755)

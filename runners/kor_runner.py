@@ -137,7 +137,7 @@ def main():
             skipped += 1
             continue
 
-        macro_call = f'{macro}("{inp}")'
+        macro_call = f'{macro}("{inp}","{out_path}")'
         cmd = [args.root_cmd, "-l", "-b", "-q", macro_call]
         rc = run_with_live_log(cmd, kor_home, log_path, args.dry_run)
         if rc != 0:
@@ -145,19 +145,16 @@ def main():
             failed += 1
             continue
 
-        # Macro writes prd_<basename>.root into kor_home. Move into run outputs.
-        produced = kor_home / out_name
         if args.dry_run:
-            print(f"[DRY] move {produced} -> {out_path}")
+            print(f"[DRY] write {out_path}")
             ok += 1
             continue
 
-        if not produced.is_file():
-            print(f"[FAIL] {inp.name}: expected output not found: {produced}")
+        if not out_path.is_file():
+            print(f"[FAIL] {inp.name}: expected output not found: {out_path}")
             failed += 1
             continue
 
-        shutil.move(str(produced), str(out_path))
         print(f"[OK]   {inp.name} -> {out_path.name}")
         ok += 1
 
