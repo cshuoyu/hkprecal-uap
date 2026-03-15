@@ -176,6 +176,170 @@ def select_points_by_angles(df, angle_pairs, phi_col, theta_col, y_col, yerr_col
     return out
 
 
+def assert_unique_angle_rows(df, phi_col, theta_col, csv_path=""):
+    phi_vals = pd.to_numeric(df[phi_col], errors="coerce")
+    theta_vals = pd.to_numeric(df[theta_col], errors="coerce")
+    work = pd.DataFrame(
+        {
+            "_phi": phi_vals,
+            "_theta": theta_vals,
+        }
+    )
+    finite = np.isfinite(work["_phi"].values) & np.isfinite(work["_theta"].values)
+    if not np.any(finite):
+        return
+
+    counts = (
+        work.loc[finite]
+        .groupby(["_phi", "_theta"], as_index=False)
+        .size()
+        .rename(columns={"size": "n"})
+    )
+    dups = counts[counts["n"] > 1].reset_index(drop=True)
+    if dups.empty:
+        return
+
+    examples = []
+    for _, row in dups.head(5).iterrows():
+        phi = float(row["_phi"])
+        theta = float(row["_theta"])
+        mask = finite.copy()
+        mask &= np.isclose(phi_vals.values, phi, atol=1e-8)
+        mask &= np.isclose(theta_vals.values, theta, atol=1e-8)
+        file_hint = ""
+        if "file" in df.columns:
+            files = [
+                str(x)
+                for x in df.loc[mask, "file"].dropna().astype(str).tolist()[:3]
+            ]
+            if files:
+                file_hint = " files={}".format(files)
+        phi_txt = int(phi) if float(phi).is_integer() else phi
+        theta_txt = int(theta) if float(theta).is_integer() else theta
+        examples.append(
+            "(phi={}, theta={}, n={}{} )".format(
+                phi_txt,
+                theta_txt,
+                int(row["n"]),
+                file_hint,
+            ).replace(" )", ")")
+        )
+
+    location = " in {}".format(csv_path) if csv_path else ""
+    raise SystemExit(
+        "Duplicate angle rows found{}; please manually delete one duplicated row from the CSV and rerun. {}".format(
+            location,
+            "; ".join(examples),
+        )
+    )
+
+
+def _safe_ratio(num, den):
+    num_arr = np.asarray(num, dtype=float)
+    out = np.full(num_arr.shape, np.nan, dtype=float)
+    if not np.isfinite(den) or float(den) == 0.0:
+        return out
+    mask = np.isfinite(num_arr)
+    out[mask] = num_arr[mask] / float(den)
+    return out
+
+
+def _safe_ratio_err(num, num_err, den, den_err):
+    num_arr = np.asarray(num, dtype=float)
+    num_err_arr = np.asarray(num_err, dtype=float)
+    out = np.full(num_arr.shape, np.nan, dtype=float)
+    if not np.isfinite(den) or float(den) == 0.0:
+        return out
+    mask = np.isfinite(num_arr)
+    if not np.any(mask):
+        return out
+    rel_num = np.zeros(num_arr.shape, dtype=float)
+    rel_den = 0.0
+    nonzero_num = mask & (num_arr != 0.0)
+    rel_num[nonzero_num] = np.square(num_err_arr[nonzero_num] / num_arr[nonzero_num])
+    if np.isfinite(den_err):
+        rel_den = float((den_err / den) ** 2)
+    out[mask] = np.abs(num_arr[mask] / den) * np.sqrt(rel_num[mask] + rel_den)
+    return out
+
+
+def recompute_kor_relative_columns(df):
+    out_df = df.copy()
+    if "phi_raw" not in out_df.columns or "theta_raw" not in out_df.columns:
+        return out_df
+
+    phi_vals = pd.to_numeric(out_df["phi_raw"], errors="coerce")
+    theta_vals = pd.to_numeric(out_df["theta_raw"], errors="coerce")
+
+    def _center_stats(grp, value_col, err_col):
+        center_rows = grp[np.isclose(theta_vals.loc[grp.index].values, 0.0, atol=1e-8)]
+        if center_rows.empty:
+            raise SystemExit(
+                "KOR normalization requires theta_raw=0 center row after manual CSV cleanup; missing for phi_raw={}.".format(
+                    grp["phi_raw"].iloc[0]
+                )
+            )
+        vals = pd.to_numeric(center_rows[value_col], errors="coerce").values
+        finite = np.isfinite(vals)
+        if not np.any(finite):
+            return np.nan, np.nan
+        ref_val = float(np.nanmean(vals[finite]))
+        if err_col not in center_rows.columns:
+            return ref_val, np.nan
+        errs = pd.to_numeric(center_rows[err_col], errors="coerce").values
+        n_err = int(np.sum(np.isfinite(errs)))
+        ref_err = (
+            float(np.sqrt(np.nansum(errs**2)) / n_err)
+            if n_err > 0
+            else np.nan
+        )
+        return ref_val, ref_err
+
+    if "gain" in out_df.columns:
+        out_df["relative_gain"] = np.nan
+        out_df["relative_gain_err"] = np.nan
+        for phi_value, grp in out_df.groupby(phi_vals):
+            if not np.isfinite(phi_value):
+                continue
+            idx = grp.index
+            g0, g0_err = _center_stats(grp, "gain", "gain_err")
+            gains = pd.to_numeric(out_df.loc[idx, "gain"], errors="coerce").values
+            gain_errs = (
+                pd.to_numeric(out_df.loc[idx, "gain_err"], errors="coerce").values
+                if "gain_err" in out_df.columns
+                else np.full(len(idx), np.nan, dtype=float)
+            )
+            out_df.loc[idx, "relative_gain"] = _safe_ratio(gains, g0)
+            out_df.loc[idx, "relative_gain_err"] = _safe_ratio_err(
+                gains, gain_errs, g0, g0_err
+            )
+
+    if "sig_yield" in out_df.columns:
+        out_df["relative_qe"] = np.nan
+        out_df["relative_qe_err"] = np.nan
+        out_df["relative_de"] = np.nan
+        out_df["relative_de_err"] = np.nan
+        for phi_value, grp in out_df.groupby(phi_vals):
+            if not np.isfinite(phi_value):
+                continue
+            idx = grp.index
+            s0, s0_err = _center_stats(grp, "sig_yield", "sig_err")
+            sig = pd.to_numeric(out_df.loc[idx, "sig_yield"], errors="coerce").values
+            sig_err = (
+                pd.to_numeric(out_df.loc[idx, "sig_err"], errors="coerce").values
+                if "sig_err" in out_df.columns
+                else np.full(len(idx), np.nan, dtype=float)
+            )
+            rel = _safe_ratio(sig, s0)
+            rel_err = _safe_ratio_err(sig, sig_err, s0, s0_err)
+            out_df.loc[idx, "relative_qe"] = rel
+            out_df.loc[idx, "relative_qe_err"] = rel_err
+            out_df.loc[idx, "relative_de"] = rel
+            out_df.loc[idx, "relative_de_err"] = rel_err
+
+    return out_df
+
+
 def _aggregate_xy_rows(rows):
     # Aggregate duplicate x values with mean (and mean yerr if provided).
     if not rows:
@@ -394,6 +558,8 @@ def build_line_from_series_cfg(series_cfg):
     yerr_col = str(cfg.get("yerr_col", "")).strip()
 
     df, csv_path = load_csv(cfg["csv"])
+    if system == "kor":
+        df = recompute_kor_relative_columns(df)
     y_col = resolve_value_column(df, y_col)
     yerr_col = resolve_value_column(df, yerr_col)
     phi_col, theta_col = resolve_angle_columns(
@@ -419,6 +585,7 @@ def build_line_from_series_cfg(series_cfg):
             }
         )
     elif mode in ("angle_pairs",):
+        assert_unique_angle_rows(df, phi_col, theta_col, csv_path=csv_path)
         angle_pairs = cfg.get("angle_pairs")
         if not angle_pairs:
             raise SystemExit("series mode=angle_pairs requires angle_pairs")
@@ -445,6 +612,7 @@ def build_line_from_series_cfg(series_cfg):
             }
         )
     elif mode in ("phi_pair", "hamamatsu_phi_pair"):
+        assert_unique_angle_rows(df, phi_col, theta_col, csv_path=csv_path)
         out = build_phi_pair_profile(
             df=df,
             phi_col=phi_col,
@@ -458,6 +626,7 @@ def build_line_from_series_cfg(series_cfg):
             center_value=cfg.get("center_value", None),
         )
     elif mode in ("single_phi", "kor_hamamatsu_single_phi"):
+        assert_unique_angle_rows(df, phi_col, theta_col, csv_path=csv_path)
         out = build_single_phi_profile(
             df=df,
             phi_col=phi_col,
