@@ -19,7 +19,7 @@ import zfit
 from zfit import z
 
 from . import common_math, fitter_interface
-from uap.scan_reader import kor_reader
+from uap.scan_reader import aus_reader, kor_reader
 from uap.tool import scan_prepare
 
 
@@ -72,6 +72,9 @@ class KORBackscatterPDF(zfit.pdf.BasePDF):
 
 E_CHARGE_PC = 1.602176634e-7
 CHARGE_METHOD_NAME = "fitandplot_kor_charge"
+CHARGE_AUS_METHOD_NAME = "fitandplot_aus_charge"
+CHARGE_METHOD_NAMES = (CHARGE_METHOD_NAME, CHARGE_AUS_METHOD_NAME)
+SAMPLE_NS = 2.0
 LEGACY_KOR_PED_WINDOW_WIDTH = 2.9
 LEGACY_KOR_SPE_WINDOW_WIDTH = 1.3
 LEGACY_KOR_PEAK_SEPARATION = 2.3
@@ -122,27 +125,57 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         auto_qmin=0.0005,
         auto_qmax=0.9995,
         min_events=50,
+        spe_mu_min_pc=1.0,
+        spe_mu_max_pc=2.5,
+        spe_mu_prior=None,
+        spe_sigma_prior=None,
     ):
         self.method_name = str(method_name or CHARGE_METHOD_NAME).strip()
         self.nbins = int(nbins)
         self.inc_backscatter = bool(inc_backscatter)
-        self.npe = 3 if int(npe) == 3 else 2
+        self.npe = int(npe) if int(npe) in (1, 2, 3) else 2
         self.charge_branch = str(charge_branch or "auto")
         self.charge_qmin = charge_qmin
         self.charge_qmax = charge_qmax
         self.auto_qmin = float(np.clip(auto_qmin, 0.0, 1.0))
         self.auto_qmax = float(np.clip(auto_qmax, 0.0, 1.0))
         self.min_events = max(int(min_events), 1)
+        self.spe_mu_min_pc = (
+            float(spe_mu_min_pc) if spe_mu_min_pc is not None else None
+        )
+        self.spe_mu_max_pc = (
+            float(spe_mu_max_pc) if spe_mu_max_pc is not None else None
+        )
+        self.spe_mu_prior = self._validate_prior(spe_mu_prior)
+        self.spe_sigma_prior = self._validate_prior(spe_sigma_prior)
         self.fig_dir = Path(fig_dir).resolve() if fig_dir else None
         if self.fig_dir:
             self.fig_dir.mkdir(parents=True, exist_ok=True)
 
     def fit(self, request):
-        if self.method_name == CHARGE_METHOD_NAME:
+        if self.method_name in CHARGE_METHOD_NAMES:
             return self._fit_kor_charge(request)
         raise RuntimeError(
             "Unsupported built-in charge fit method: {}".format(self.method_name)
         )
+
+    @staticmethod
+    def _validate_prior(prior):
+        if prior is None:
+            return None
+        try:
+            mean, sigma = prior
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Prior must be a (mean, sigma) pair, got {!r}".format(prior)
+            )
+        mean = float(mean)
+        sigma = float(sigma)
+        if not np.isfinite(mean) or not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError(
+                "Prior (mean={}, sigma={}) must be finite with sigma>0".format(mean, sigma)
+            )
+        return (mean, sigma)
 
     @staticmethod
     def _coord_key(coord):
@@ -541,16 +574,16 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         ax.set_ylim(max(ymin, 0.5), max(ymax * 1.5, 2.0))
         if text_lines:
             ax.text(
-                0.03,
+                0.78,
                 0.97,
                 "\n".join(text_lines),
                 transform=ax.transAxes,
                 va="top",
-                ha="left",
-                fontsize=11,
+                ha="right",
+                fontsize=10,
                 bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
             )
-        ax.legend(loc="best")
+        ax.legend(loc="upper right")
         fig.tight_layout()
         target = Path(out_png).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -677,6 +710,18 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         if spe_mu_hi <= spe_mu_lo:
             spe_mu_hi = min(float(xmax), float(spe_mu_lo + max(0.3, 0.15 * span)))
 
+        # User-level SPE peak constraint (e.g. 1.0–2.5 pC), intersected with
+        # the data range for safety. Falls back to the loose bounds above if
+        # the requested window does not overlap the data range.
+        if self.spe_mu_min_pc is not None or self.spe_mu_max_pc is not None:
+            user_lo = float(self.spe_mu_min_pc) if self.spe_mu_min_pc is not None else -np.inf
+            user_hi = float(self.spe_mu_max_pc) if self.spe_mu_max_pc is not None else np.inf
+            cand_lo = max(float(xmin), float(mu_ped_guess + 0.05), user_lo)
+            cand_hi = min(float(xmax), user_hi)
+            if cand_hi > cand_lo:
+                spe_mu_lo = cand_lo
+                spe_mu_hi = cand_hi
+
         sigma_ped_lo = max(1e-4, float(0.5 * sigma_ped_guess))
         sigma_ped_hi = max(
             sigma_ped_lo * 1.2, float(np.sqrt(2.0) * sigma_ped_guess), 0.1
@@ -785,7 +830,20 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             components.append(bs_pdf.create_extended(bs_yield))
 
         model = zfit.pdf.SumPDF(components)
-        nll = zfit.loss.ExtendedUnbinnedNLL(model, data)
+        constraints = []
+        if self.spe_mu_prior is not None:
+            mean, sigma = self.spe_mu_prior
+            constraints.append(zfit.constraint.GaussianConstraint(
+                params=mu_spe, observation=mean, uncertainty=sigma,
+            ))
+        if self.spe_sigma_prior is not None:
+            mean, sigma = self.spe_sigma_prior
+            constraints.append(zfit.constraint.GaussianConstraint(
+                params=sigma_spe, observation=mean, uncertainty=sigma,
+            ))
+        nll = zfit.loss.ExtendedUnbinnedNLL(
+            model, data, constraints=constraints if constraints else None
+        )
         minimizer = zfit.minimize.Minuit()
         result = minimizer.minimize(nll)
         try:
@@ -943,6 +1001,18 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         out_df = df.copy()
         out_df["relative_gain"] = np.nan
         out_df["relative_gain_err"] = np.nan
+        # Charge-based relative QE proxy: SPE-peak yield / events in fit window,
+        # normalized per phi to the theta_raw=0 reference.
+        spe_y = pd.to_numeric(out_df.get("spe_yield"), errors="coerce").astype(float)
+        spe_y_err = pd.to_numeric(out_df.get("spe_yield_err"), errors="coerce").astype(float)
+        n_in = pd.to_numeric(out_df.get("n_in_window"), errors="coerce").astype(float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out_df["rel_qe_charge"] = np.where(n_in > 0, spe_y / n_in, np.nan)
+            out_df["rel_qe_charge_err"] = np.where(
+                n_in > 0, spe_y_err / n_in, np.nan
+            )
+        out_df["rel_qe_charge_norm"] = np.nan
+        out_df["rel_qe_charge_norm_err"] = np.nan
 
         for phi_value, grp in out_df.groupby("phi_raw"):
             idx = grp.index
@@ -989,9 +1059,157 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         return out_df
 
     def _prepare_aus_input(self, args):
-        raise RuntimeError(
-            "ChargeSpectrumFitter AUS interface is reserved but not implemented yet."
+        _input_dir, out_csv, files = self.resolve_inputs(
+            args=args,
+            default_out_csv="csv/aus_charge_results.csv",
+            file_pattern="output_theta*_phi*.root",
+            empty_msg="No output_theta*_phi*.root found in: {}",
         )
+
+        defaults = dict(aus_reader.DEFAULT_AUS_CHANNELS)
+        ctx = scan_prepare.resolve_aus_context(
+            args, defaults, aus_reader.resolve_aus_channel
+        )
+        self.log_channel_config(
+            system="aus",
+            serial=ctx["serial"],
+            resolved={
+                "pmt_ch": int(ctx["pmt_ch"]),
+                "trigger_ch": int(ctx["trigger_ch"]),
+                "sipm_ch": int(ctx["sipm_ch"]),
+            },
+            cfg={
+                "pmt_ch": str(ctx["pmt_ch_cfg"]),
+                "trigger_ch": str(ctx["trigger_ch_cfg"]),
+                "sipm_ch": str(ctx["sipm_ch_cfg"]),
+            },
+            defaults=defaults,
+        )
+
+        pmt_tree = "Tree_CH{}".format(ctx["pmt_ch"])
+        trigger_tree = "Tree_CH{}".format(ctx["trigger_ch"])
+        charge_branch = self._resolve_charge_branch("aus")
+        require_ps = bool(getattr(args, "require_pulsestart", False))
+        apply_tcut = bool(getattr(args, "apply_timing_cut", False))
+        timing_cut = getattr(args, "timing_cut", (300.0, 320.0)) or (300.0, 320.0)
+        tmin_ns, tmax_ns = float(timing_cut[0]), float(timing_cut[1])
+
+        prep_stats = {
+            "files_scanned": int(len(files)),
+            "files_kept": 0,
+            "charge_read_fail": 0,
+            "empty_fit_range": 0,
+            "too_few_events": 0,
+        }
+        points = []
+
+        for idx, fp in enumerate(files):
+            parsed = aus_reader.parse_theta_phi_aus(fp)
+            if parsed is None:
+                continue
+            theta, phi = parsed
+
+            charge = self.run_step(
+                lambda: aus_reader.load_branch(fp, pmt_tree, charge_branch),
+                stats=prep_stats,
+                fail_key="charge_read_fail",
+                file_name=fp.name,
+                fail_msg="read AUS charge branch failed",
+            )
+            if charge is None:
+                continue
+
+            if require_ps or apply_tcut:
+                ps_pmt = self.run_step(
+                    lambda: aus_reader.load_branch(fp, pmt_tree, "PulseStart") * SAMPLE_NS,
+                    stats=prep_stats,
+                    fail_key="charge_read_fail",
+                    file_name=fp.name,
+                    fail_msg="read PMT PulseStart failed",
+                )
+                if ps_pmt is None:
+                    continue
+                mask = np.isfinite(ps_pmt)
+                if apply_tcut:
+                    ps_las = self.run_step(
+                        lambda: aus_reader.load_branch(fp, trigger_tree, "PulseStart")
+                        * SAMPLE_NS,
+                        stats=prep_stats,
+                        fail_key="charge_read_fail",
+                        file_name=fp.name,
+                        fail_msg="read trigger PulseStart failed",
+                    )
+                    if ps_las is None:
+                        continue
+                    delta = ps_pmt - ps_las
+                    mask &= np.isfinite(delta) & (delta > tmin_ns) & (delta < tmax_ns)
+                charge = np.asarray(charge)[mask]
+
+            charge = self._finite_1d(charge)
+            if charge.size == 0:
+                self.inc_stat(prep_stats, "empty_fit_range")
+                continue
+
+            try:
+                use_qmin, use_qmax, peak = self._resolve_fit_range(charge)
+            except Exception:
+                self.inc_stat(prep_stats, "empty_fit_range")
+                continue
+
+            fit_values = self._clip_to_range(charge, use_qmin, use_qmax)
+            if fit_values.size < self.min_events:
+                self.inc_stat(prep_stats, "too_few_events")
+                self.log_skip(
+                    fp.name,
+                    "charge fit skipped after range selection: n={} < min_events={}".format(
+                        fit_values.size, self.min_events
+                    ),
+                )
+                continue
+
+            row = {
+                "system": "aus",
+                "file": fp.name,
+                "serial": str(ctx["serial"]),
+                "pmt_ch": int(ctx["pmt_ch"]),
+                "trigger_ch": int(ctx["trigger_ch"]),
+                "sipm_ch": int(ctx["sipm_ch"]),
+                "pmt_ch_cfg": str(ctx["pmt_ch_cfg"]),
+                "trigger_ch_cfg": str(ctx["trigger_ch_cfg"]),
+                "sipm_ch_cfg": str(ctx["sipm_ch_cfg"]),
+                "theta": int(theta),
+                "phi": int(phi),
+                "charge_method": self.method_name,
+                "npe": int(self.npe),
+                "charge_branch": str(charge_branch),
+                "include_backscatter": bool(self.inc_backscatter),
+                "charge_range_min": float(use_qmin),
+                "charge_range_max": float(use_qmax),
+                "charge_peak": float(peak),
+                "require_pulsestart": bool(require_ps),
+                "apply_timing_cut": bool(apply_tcut),
+                "timing_cut_min_ns": float(tmin_ns) if apply_tcut else np.nan,
+                "timing_cut_max_ns": float(tmax_ns) if apply_tcut else np.nan,
+            }
+
+            points.append(
+                self.make_point(
+                    row=row,
+                    main_fit_input=self.make_fit_input(
+                        data=fit_values,
+                        coord=("aus_charge", ctx["serial"], int(theta), int(phi), idx),
+                        plotname="aus_charge_{}_theta{}_phi{}_{}".format(
+                            ctx["serial"] or "SNX", theta, phi, idx
+                        ),
+                        xr=(use_qmin, use_qmax),
+                        meta={"n_in_window": int(fit_values.size)},
+                    ),
+                    main_skip_msg="[SKIP] {}: AUS charge fit failed.".format(fp.name),
+                )
+            )
+            prep_stats["files_kept"] += 1
+
+        return {"out_csv": out_csv, "points": points, "prep_stats": prep_stats}
 
     def _prepare_kor_input(self, args):
         _input_dir, out_csv, files = self.resolve_inputs(
@@ -1134,7 +1352,14 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
 
     def prepare_scan(self, system, args):
         if system == "aus":
-            return self._prepare_aus_input(args)
+            inputs = self._prepare_aus_input(args)
+            return {
+                "out_csv": inputs["out_csv"],
+                "points": inputs["points"],
+                "prep_stats": inputs.get("prep_stats", {}),
+                "sort_cols": ["phi", "theta", "file"],
+                "empty_msg": "No valid AUS charge-fit results produced.",
+            }
 
         if system == "kor":
             inputs = self._prepare_kor_input(args)

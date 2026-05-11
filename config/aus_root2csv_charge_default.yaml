@@ -1,0 +1,81 @@
+# @package _global_
+# Default Hydra config for root2csv (AUS charge).
+#
+# By default runs the charge fit on the RAW PulseCharge branch with NO cuts
+# applied (reproduces our "uncut" view — tall pedestal). Flip require_pulsestart
+# to reproduce AUS's implicit LED-discriminator cut, or apply_timing_cut to
+# additionally apply delta_PMT_trigger ∈ [300, 320] ns.
+
+# -----------------------------------------------------------------------------
+# Hydra configuration.
+# -----------------------------------------------------------------------------
+hydra:
+  run:
+    dir: ${oc.env:UAP_HOME,.}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-root2csv-${system}-charge
+  job:
+    chdir: true
+
+# -----------------------------------------------------------------------------
+# Input dataset.
+# -----------------------------------------------------------------------------
+system: aus
+input_dir: /path/to/your/aus/root/outputs
+serial: EL1635B
+
+# -----------------------------------------------------------------------------
+# Fit configuration.
+# -----------------------------------------------------------------------------
+fit_method: fitandplot_aus_charge
+max_files: 0
+
+# -----------------------------------------------------------------------------
+# Channel configuration. "auto" uses AUS defaults (trigger=0, sipm=1, pmt=2).
+# -----------------------------------------------------------------------------
+pmt_ch: auto
+trigger_ch: auto
+sipm_ch: auto
+no_sipm: true    # no SiPM leg for charge-only analysis
+
+# -----------------------------------------------------------------------------
+# Charge fit configuration.
+# -----------------------------------------------------------------------------
+charge_branch: PulseCharge
+# Wide range (like KOR's [-2, 6]) so 2PE / backscatter tails don't get cut off.
+# Leave auto: set charge_fit_range to null to use quantile-based auto range.
+charge_fit_range: [-1.0, 6.0]
+# npe=2: include 2PE Gaussian (mean/sigma tied geometrically to SPE).
+# Backscatter on: models the shoulder between pedestal and SPE.
+npe: 2
+inc_backscatter: true
+
+# Tighten SPE position bound — data clearly peaks near 2.0 pC; narrower
+# window prevents SPE drifting to soak up 2PE tail.
+spe_mu_min_pc: 1.5
+spe_mu_max_pc: 2.5
+
+# Gaussian priors added to the NLL (same as the ped+spe / ped+spe+bs configs
+# so the three runs are comparable).
+spe_mu_prior: [2.0, 0.15]
+spe_sigma_prior: [0.5, 0.1]
+
+# -----------------------------------------------------------------------------
+# AUS-specific cuts (all OFF → raw uncut spectrum).
+# -----------------------------------------------------------------------------
+# Drop events with NaN PMT PulseStart (AUS's implicit LED-discriminator cut).
+require_pulsestart: false
+# Apply numeric timing window on delta_PMT_trigger (auto implies require_pulsestart).
+apply_timing_cut: false
+timing_cut: [300.0, 320.0]
+
+# -----------------------------------------------------------------------------
+# EMG-only knobs (ignored for charge fit, kept here so the shared AUS
+# argparse/hydra schema is satisfied).
+# -----------------------------------------------------------------------------
+tmin: 304.0
+tmax: 314.0
+window_half_width: 5.0
+window_bin_width: 0.0
+sipm_tmin: 95.0
+sipm_tmax: 105.0
+sipm_window_half_width: 5.0
+sipm_window_bin_width: 0.0
