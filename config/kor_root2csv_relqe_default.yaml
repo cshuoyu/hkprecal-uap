@@ -1,0 +1,49 @@
+# @package _global_
+# Default Hydra config for cut-based KOR relative QE (no fitting).
+
+# -----------------------------------------------------------------------------
+# Hydra
+# -----------------------------------------------------------------------------
+hydra:
+  run:
+    dir: ${oc.env:UAP_HOME,.}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-root2csv-relqe-${system}
+  job:
+    chdir: true
+
+# -----------------------------------------------------------------------------
+# Input
+# -----------------------------------------------------------------------------
+system: kor
+input_dir: /path/to/your/kor/prd/outputs
+serial: EL1635B
+
+# -----------------------------------------------------------------------------
+# Method
+# -----------------------------------------------------------------------------
+# Cut-based relative QE (no zfit fitting).
+fit_method: kor_relative_qe
+max_files: 0
+
+# -----------------------------------------------------------------------------
+# Channel configuration
+# -----------------------------------------------------------------------------
+# auto -> first/second/third PMT in filename -> ch 0/1/2; trigger -> ch 3.
+channel: auto
+trigger_ch: auto
+
+# -----------------------------------------------------------------------------
+# Selection cuts (kor2.pdf, 2026-04-08)
+# -----------------------------------------------------------------------------
+# Step 2: pulse-height threshold in mV, applied to max * ADC_to_mV.
+pulse_thr_mv: 5.0
+
+# Step 3: timing cut on `diff` branch (= falltime_PMT - triggerTime, samples).
+# 40 ns window around the fixed response time.
+diff_lo_smp: 195
+diff_hi_smp: 215
+
+# Step 4: dark-subtraction scaling.
+# T_signal_eff defaults to diff cut width (= 40 ns).
+# T_dark is read from prd (Config_DarkWindow_ns_chN); fallback below if missing.
+t_signal_eff_ns: null          # null -> (diff_hi - diff_lo) * 2 ns
+default_dark_window_ns: 600.0
