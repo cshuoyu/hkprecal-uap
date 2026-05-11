@@ -5,15 +5,27 @@ import argparse
 import logging
 from pathlib import Path
 
-from uap.fit.charge_spectrum_fit import CHARGE_METHOD_NAME, ChargeSpectrumFitter
+from uap.fit.charge_spectrum_fit import (
+    CHARGE_METHOD_NAME,
+    CHARGE_METHOD_NAMES,
+    ChargeSpectrumFitter,
+)
 from uap.fit.emg_timing_offset_fit import TimingEMGFitter
+from uap.fit.kor_relative_qe_fit import (
+    METHOD_NAME as KOR_RELQE_METHOD_NAME,
+    KorRelativeQEFitter,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
 def _is_charge_method(method_name):
-    return str(method_name or "").strip() == CHARGE_METHOD_NAME
+    return str(method_name or "").strip() in CHARGE_METHOD_NAMES
+
+
+def _is_kor_relqe_method(method_name):
+    return str(method_name or "").strip() == KOR_RELQE_METHOD_NAME
 
 
 def _add_charge_args(parser):
@@ -25,6 +37,11 @@ def _add_charge_args(parser):
         metavar=("QMIN", "QMAX"),
         default=None,
     )
+    parser.add_argument("--npe", type=int, choices=[1, 2, 3], default=2)
+    parser.add_argument("--spe-mu-min-pc", type=float, default=1.0,
+                        help="Lower bound on SPE peak position (pC). Default 1.0")
+    parser.add_argument("--spe-mu-max-pc", type=float, default=2.5,
+                        help="Upper bound on SPE peak position (pC). Default 2.5")
 
 
 def build_fitter(args, out_csv_path):
@@ -34,22 +51,47 @@ def build_fitter(args, out_csv_path):
         if fig_dir_arg
         else Path(out_csv_path).resolve().parent / "figures"
     )
+    if _is_kor_relqe_method(args.fit_method):
+        return KorRelativeQEFitter(
+            diff_lo_samples=int(getattr(args, "diff_lo_smp", 195)),
+            diff_hi_samples=int(getattr(args, "diff_hi_smp", 215)),
+            pulse_thr_mv=float(getattr(args, "pulse_thr_mv", 5.0)),
+            t_signal_eff_ns=getattr(args, "t_signal_eff_ns", None),
+            default_dark_window_ns=float(getattr(args, "default_dark_window_ns", 600.0)),
+            fig_dir=fig_dir,
+        )
     if _is_charge_method(args.fit_method):
         qmin, qmax = (None, None)
         fit_range = getattr(args, "charge_fit_range", None)
         if fit_range:
             qmin, qmax = [float(x) for x in fit_range]
+        def _prior_tuple(val):
+            if val is None:
+                return None
+            seq = list(val)
+            if len(seq) != 2:
+                raise ValueError("Prior must be a [mean, sigma] pair, got {!r}".format(val))
+            return (float(seq[0]), float(seq[1]))
         return ChargeSpectrumFitter(
-            method_name=CHARGE_METHOD_NAME,
+            method_name=str(args.fit_method).strip(),
             fig_dir=fig_dir,
             inc_backscatter=bool(
                 getattr(args, "inc_backscatter", getattr(args, "inc_bkg", True))
             ),
+            npe=int(getattr(args, "npe", 2)),
             charge_branch=getattr(args, "charge_branch", "auto"),
             charge_qmin=qmin,
             charge_qmax=qmax,
+            spe_mu_min_pc=getattr(args, "spe_mu_min_pc", 1.0),
+            spe_mu_max_pc=getattr(args, "spe_mu_max_pc", 2.5),
+            spe_mu_prior=_prior_tuple(getattr(args, "spe_mu_prior", None)),
+            spe_sigma_prior=_prior_tuple(getattr(args, "spe_sigma_prior", None)),
         )
-    return TimingEMGFitter(method_name=args.fit_method, fig_dir=fig_dir)
+    nbins_arg = getattr(args, "plot_nbins", None)
+    emg_kwargs = {"method_name": args.fit_method, "fig_dir": fig_dir}
+    if nbins_arg:
+        emg_kwargs["nbins"] = int(nbins_arg)
+    return TimingEMGFitter(**emg_kwargs)
 
 
 def build_parser():
@@ -81,6 +123,21 @@ def build_parser():
     ap_aus.add_argument("--no-inc-bkg", dest="inc_bkg", action="store_false")
     ap_aus.set_defaults(inc_bkg=True)
     ap_aus.add_argument("--max-files", type=int, default=0)
+    # Charge-fit specific cuts (only consulted when fit_method is a charge method).
+    ap_aus.add_argument("--require-pulsestart", dest="require_pulsestart",
+                        action="store_true",
+                        help="Drop events with NaN PMT PulseStart "
+                             "(reproduces AUS implicit LED discriminator cut)")
+    ap_aus.set_defaults(require_pulsestart=False)
+    ap_aus.add_argument("--apply-timing-cut", dest="apply_timing_cut",
+                        action="store_true",
+                        help="Apply delta_PMT_trigger timing cut on charge fit input")
+    ap_aus.set_defaults(apply_timing_cut=False)
+    ap_aus.add_argument("--timing-cut", nargs=2, type=float,
+                        metavar=("TMIN_NS", "TMAX_NS"),
+                        default=[300.0, 320.0],
+                        help="Timing cut window in ns for charge fit "
+                             "(used only with --apply-timing-cut)")
 
     ap_kor = sub.add_parser("kor", help="KOR diff fit from prd_*.root")
     ap_kor.add_argument("--input-dir", required=True)
@@ -100,6 +157,18 @@ def build_parser():
     ap_kor.add_argument("--tmin", type=float, default=None)
     ap_kor.add_argument("--tmax", type=float, default=None)
     ap_kor.add_argument("--max-files", type=int, default=0)
+    # Relative-QE (cut-based) options
+    ap_kor.add_argument("--diff-lo-smp", type=int, default=195,
+                        help="Lower bound of timing cut in ADC samples (default 195)")
+    ap_kor.add_argument("--diff-hi-smp", type=int, default=215,
+                        help="Upper bound of timing cut in ADC samples (default 215)")
+    ap_kor.add_argument("--pulse-thr-mv", type=float, default=5.0,
+                        help="Pulse-height threshold in mV (default 5.0)")
+    ap_kor.add_argument("--t-signal-eff-ns", type=float, default=None,
+                        help="Effective signal window for dark scaling (ns). "
+                             "Default = diff cut width.")
+    ap_kor.add_argument("--default-dark-window-ns", type=float, default=600.0,
+                        help="Fallback T_dark (ns) if prd file lacks Config_DarkWindow_ns")
     return ap
 
 

@@ -24,7 +24,7 @@ from aus_runner import (
 
 
 def run_cmd(cmd):
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, check=False)
     return proc.returncode, proc.stdout
 
 

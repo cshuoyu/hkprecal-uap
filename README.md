@@ -93,6 +93,119 @@ hkprecal-uap/
    - optional conversion to Hamamatsu angle
 3. Overlay all lines into one figure.
 
+## Data File Structures
+
+### AUS System
+
+#### Raw files: `wave0_theta{θ}_phi{φ}.txt`
+
+CAEN digitizer wavedump format. One file per angle point. Each event is a fixed-length block:
+
+```
+Record Length: 260
+BoardID: 31
+Channel: 0
+Event Number: 0
+Pattern: 0x0000
+Trigger Time Stamp: 59443
+DC offset (DAC): 0xBFFF
+4009       ← ADC sample 0
+4001       ← ADC sample 1
+...        ← 260 × 14-bit ADC values total
+```
+
+#### Processed ROOT files: `output_theta{θ}_phi{φ}.root`
+
+Produced by Pyrate from the raw `.txt` files. One file per angle point. Contains three TTrees (one per digitizer channel), each with ~600k entries:
+
+| Tree | Role |
+|------|------|
+| `Tree_CH0` | Trigger (laser reference) |
+| `Tree_CH1` | SiPM (normalization reference) |
+| `Tree_CH2` | PMT under test |
+
+Branches (same layout on all three trees):
+
+| Branch | dtype | Description |
+|--------|-------|-------------|
+| `PulseStart` | float64 | Pulse leading-edge time (samples). Multiply by 2 ns/sample to get ns. |
+| `PulseCharge` | float64 | Integrated charge (ADC·sample units) |
+| `PeakHeight` | float64 | Waveform peak amplitude (ADC units) |
+| `PeakLocation` | float64 | Sample index of the peak |
+| `CFDPulseStart` | float64 | Constant-fraction discriminator timing (samples) |
+| `LEDTimes` | object (variable-length array) | LED pulse times |
+
+The analysis uses `PulseStart` only. The timing observable is:
+```
+delta_PMT  = Tree_CH2.PulseStart − Tree_CH0.PulseStart   (× 2 ns/sample)
+delta_SiPM = Tree_CH1.PulseStart − Tree_CH0.PulseStart   (× 2 ns/sample)
+```
+
+---
+
+### KOR System
+
+#### Raw files: `{serials}_{date}.root` (no `prd_` prefix)
+
+Produced directly by the digitizer DAQ. One file per angle point, containing all three PMTs. Single TTree `T` with 200,000 events:
+
+| Branch | dtype | Shape | Description |
+|--------|-------|-------|-------------|
+| `ADC` | uint32 | **(200000, 8, 1024)** | Raw waveforms: events × 8 channels × 1024 samples. Baseline ≈ 15000 ADC counts. |
+| `EventNumber` | uint32 | (200000,) | Sequential event index |
+| `TriggerTimeTag` | uint32 | (200000,) | Hardware trigger timestamp |
+| `RecordLength` | uint32 | fixed = 1024 | Samples per waveform |
+| `PostTrigger` | uint32 | fixed = 60 | Samples retained after trigger |
+| `OffsetValue0–3` | uint32 | fixed = 7050 | DC offset per channel group |
+| `TriggerValue` | uint32 | fixed = 4095 | Trigger threshold |
+| `ActiveChannels76543210` | object | (200000,) | Bitmask of active channels per event |
+
+#### Processed ROOT files: `prd_{serials}_{date}.root` (with `prd_` prefix)
+
+Produced by KOR NTP macros from the raw files. One file per angle point, containing all three PMTs. Contains four TTrees and pre-built summary histograms:
+
+TTrees (one per digitizer channel):
+
+| Tree | Role | `diff` mean |
+|------|------|-------------|
+| `tree_ch0` | PMT #1 | ≈ 11 samples (≈ 22 ns) |
+| `tree_ch1` | PMT #2 | ≈ 15 samples (≈ 30 ns) |
+| `tree_ch2` | (unpopulated in standard runs) | ≈ 21 samples |
+| `tree_ch3` | PMT #3 / trigger reference | ≈ 421 samples (≈ 842 ns) |
+
+Branches (same layout on all four trees):
+
+| Branch | dtype | Description |
+|--------|-------|-------------|
+| `diff` | float64 | Timing difference relative to trigger (samples). Multiply by 2 ns/sample. |
+| `falltime` | float64 | Waveform falling-edge time (samples) |
+| `max` | float64 | Waveform peak amplitude |
+| `max_time` | int32 | Sample index of the peak (typically ≈ 616) |
+| `LiveTime` | float64 | Acquisition live time (ms, 0–200) |
+| `pico` | float64 | Picoammeter current reading |
+
+Non-tree summary objects (per channel, `{n}` = 0, 1, 2, 3):
+
+| Object | Type | Description |
+|--------|------|-------------|
+| `NoiseCount_ch{n}` | TParameter\<long\> | Dark noise event count |
+| `NoiseCountRate_ch{n}` | TParameter\<double\> | Dark noise rate (Hz) |
+| `Ped_ch{n}` | TH1D | Pedestal charge histogram |
+| `Max_ch{n}` | TH1D | Peak amplitude histogram |
+| `Time_ch{n}` | TH1D | Timing histogram |
+| `Diff_ch{n}` | TH1D | `diff` histogram |
+| `Pico_ch{n}` | TH1D | Picoammeter histogram |
+| `PicoAbove_ch{n}` | TH1D | Above-threshold picoammeter histogram |
+
+The analysis reads `diff` from `tree_ch{n}`:
+```
+timing (ns) = tree_ch{n}.diff × 2 ns/sample
+```
+
+Channel assignment is derived from the PMT serial order in the filename. The three PMTs map to channels `[0, 1, 3]` by default (channel 2 is skipped). `ch3` exhibits a noise count rate ~500× higher than `ch0`/`ch1`, suggesting it may serve as the laser trigger reference in some configurations.
+
+---
+
 ## Quick Start
 
 ### 1) Install environment

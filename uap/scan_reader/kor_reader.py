@@ -7,7 +7,16 @@ from uap.tool.root_io import (
 )
 
 
-DEFAULT_SERIAL_ORDER_CHANNELS = [0, 1, 3]
+# Raw-data channel mapping (verified from 20260129 waveforms):
+# - ch0/1/2 hold the three PMTs listed in the filename (in order),
+#   each showing sparse single-photon hits in the PMT signal window.
+# - ch3 is the laser-monitor / physical trigger: 100% hit rate at a fixed
+#   early sample, never in the PMT signal window.
+# The NTP C++ (prod_ntp_standalone.C) hardcodes TriggerCh = 2, which is
+# actually the third PMT (EL9590B). This causes diff = falltime + 1 in the
+# prd_*.root files; UAP downstream still reads the stored diff as-is.
+DEFAULT_SERIAL_ORDER_CHANNELS = [0, 1, 2]
+DEFAULT_TRIGGER_CH = 3
 
 
 # KOR scan filenames have a more complex structure
@@ -81,10 +90,7 @@ def check_serial_order_consistency(files):
 
 # Auto pick trigger channel.
 def auto_pick_trigger_channel(serial_order_channels=None):
-    order_map = list(serial_order_channels or DEFAULT_SERIAL_ORDER_CHANNELS)
-    if not order_map:
-        order_map = list(DEFAULT_SERIAL_ORDER_CHANNELS)
-    return int(order_map[0])
+    return int(DEFAULT_TRIGGER_CH)
 
 
 # Auto pick PMT channel from target serial position in filename order.
