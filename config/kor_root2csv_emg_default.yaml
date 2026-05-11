@@ -35,7 +35,9 @@ max_files: 0
 # -----------------------------------------------------------------------------
 # channel / trigger_ch:
 # - integer: force explicit channel.
-# - "auto": use defaults. (first/second/third PMT -> ch 0/1/3).
+# - "auto": use defaults.
+#   channel: first/second/third PMT in filename -> ch 0/1/2.
+#   trigger_ch: ch 3 (physical laser-monitor trigger in raw data).
 channel: auto
 trigger_ch: auto
 
@@ -48,7 +50,16 @@ tmin: 0
 tmax: 2048
 # Window is selected from peak +/- half_width.
 # tmin/tmax are used as peak-search range hints.
-window_half_width: 80
+# KOR timing FWHM ~4 ns, so ±30 ns is plenty to include the EMG tails.
+window_half_width: 30
 # Histogram bin width used during peak search.
 # 0.0 means automatic binning.
 window_bin_width: 2.0
+
+# -----------------------------------------------------------------------------
+# Display binning (unbinned fit; this only affects plots).
+# KOR timing is ADC-sample quantized at 2 ns, so bin width must match (or be a
+# multiple of) 2 ns — otherwise the histogram shows every-other-bin empty.
+# 30 bins over ±30 ns = 2 ns/bin, aligned to the sample grid.
+# -----------------------------------------------------------------------------
+plot_nbins: 30

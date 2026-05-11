@@ -14,7 +14,7 @@ hydra:
 # Input dataset.
 # -----------------------------------------------------------------------------
 system: kor
-input_dir: /path/to/your/root/outputs
+input_dir: /path/to/your/kor/root/outputs
 serial: EL1635B
 
 # -----------------------------------------------------------------------------
@@ -34,4 +34,10 @@ trigger_ch: auto
 # -----------------------------------------------------------------------------
 charge_branch: pico
 charge_fit_range: [-2.0, 6.0]
-inc_backscatter: true
+npe: 1
+inc_backscatter: false
+
+# SPE peak position constraint (pC). Keeps fit from running off to pedestal tail
+# or into 2pe territory on low-stat angles.
+spe_mu_min_pc: 1.0
+spe_mu_max_pc: 2.5
