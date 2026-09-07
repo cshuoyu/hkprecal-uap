@@ -1,6 +1,10 @@
 """KOR scan ROOT readers and angle parsing."""
 
+from functools import lru_cache
+from pathlib import Path
 import re
+import numpy as np
+import uproot
 from uap.tool.root_io import (
     list_tree_channels as list_tree_channels_common,
     read_channel_branch,
@@ -17,6 +21,37 @@ from uap.tool.root_io import (
 # prd_*.root files; UAP downstream still reads the stored diff as-is.
 DEFAULT_SERIAL_ORDER_CHANNELS = [0, 1, 2]
 DEFAULT_TRIGGER_CH = 3
+ADC_TO_MV = 2000.0 / 16384.0  # KOR v7 Config::ADC_to_mV
+
+
+@lru_cache(maxsize=2048)
+def read_run_info(source):
+    """Metadata fallback for run-number-only processed v7 filenames."""
+    path = Path(source)
+    if not path.is_file():
+        return {}
+    with uproot.open(path) as root_file:
+        if "RunInfo" not in root_file:
+            return {}
+        tree = root_file["RunInfo"]
+        if tree.num_entries != 1:
+            raise ValueError("Expected exactly one RunInfo entry: {}".format(path))
+        fields = ["SN1", "SN2", "SN3", "RawRotateAngle2", "RawTiltAngle2",
+                  "RawRotateAngle3", "RawTiltAngle3"]
+        return {name: tree[name].array(library="np")[0] for name in fields if name in tree}
+
+
+def read_charge_seed(root_path, channel):
+    """Use the saved threshold for the SPE prefit, not for the final charge fit."""
+    with uproot.open(root_path) as root_file:
+        tree = root_file["tree_ch{}".format(channel)]
+        charge = tree["pico"].array(library="np")
+        height = tree["max"].array(library="np")
+        threshold = float(root_file["Config_Threshold_mV_ch{}".format(channel)].member("fVal"))
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError("Invalid saved charge-seed threshold: {}".format(root_path))
+    selected = np.isfinite(charge) & np.isfinite(height) & (height * ADC_TO_MV > threshold)
+    return charge[selected], threshold
 
 
 # KOR scan filenames have a more complex structure
@@ -37,8 +72,14 @@ def extract_serial_block_angles(name, serial):
     pattern = re.compile(
         r"{}_hv\d+_R(?P<r>[PM]?\d+)_T(?P<t>[PM]?\d+)".format(re.escape(serial))
     )
-    match = pattern.search(name)
+    match = pattern.search(Path(name).name)
     if not match:
+        info = read_run_info(name)
+        for index in (1, 2, 3):
+            if str(info.get("SN{}".format(index), "")).upper() == str(serial).upper():
+                if index == 1:
+                    return 0, 0  # stationary monitor
+                return int(info["RawRotateAngle{}".format(index)]), int(info["RawTiltAngle{}".format(index)])
         return None
     rtag = match.group("r")
     ttag = "T" + match.group("t")
@@ -66,8 +107,12 @@ def read_tree_branch(root_path, channel, branch, tree_prefix="tree_ch"):
 def extract_serial_order(name):
     pattern = re.compile(r"([A-Za-z0-9]+)_hv\d+_R[PM]?\d+_T[PM]?\d+")
     out = []
-    for m in pattern.finditer(str(name)):
+    for m in pattern.finditer(Path(name).name):
         out.append(m.group(1))
+    if not out:
+        info = read_run_info(name)
+        if info:
+            out = [str(info["SN{}".format(index)]) for index in (1, 2, 3)]
     return out
 
 
@@ -77,7 +122,7 @@ def check_serial_order_consistency(files):
     mismatches = []
     for fp in files:
         name = getattr(fp, "name", str(fp))
-        order = [x.upper() for x in extract_serial_order(name)]
+        order = [x.upper() for x in extract_serial_order(fp)]
         if not order:
             continue
         if reference is None:
@@ -101,7 +146,7 @@ def auto_pick_channel(files, serial, trigger_ch=None, serial_order_channels=None
     serial = str(serial).upper()
     for fp in files:
         serial_order = [
-            x.upper() for x in extract_serial_order(getattr(fp, "name", str(fp)))
+            x.upper() for x in extract_serial_order(fp)
         ]
         if not serial_order:
             continue

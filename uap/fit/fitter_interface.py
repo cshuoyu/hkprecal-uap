@@ -71,8 +71,8 @@ class BaseScanFitter(BaseFitter, metaclass=ABCMeta):
 
     # Create one fit-input record used by _fit_from_input().
     @staticmethod
-    def make_fit_input(data, coord, plotname, xr, meta=None):
-        return _make_fit_input(data, coord, plotname, xr, meta=meta)
+    def make_fit_input(data, coord, plotname, xr, meta=None, fit_kwargs=None):
+        return _make_fit_input(data, coord, plotname, xr, meta=meta, fit_kwargs=fit_kwargs)
 
     # Create one point record.
     @staticmethod
@@ -225,7 +225,7 @@ class BaseScanFitter(BaseFitter, metaclass=ABCMeta):
                     data=data,
                     plotname=fit_input.get("plotname"),
                     xr=fit_input.get("xr"),
-                    fit_kwargs={"inc_bkg": inc_bkg},
+                    fit_kwargs=dict(fit_input.get("fit_kwargs", {}), inc_bkg=inc_bkg),
                 )
             ),
             file_name=str(fit_input.get("plotname", "fit_input")),

@@ -206,8 +206,8 @@ def plot_kor_standard(args):
         fig.savefig(out_png)
         plt.close(fig)
 
-    plot_line(xdf, out_dir / "kor_diff_rel_x_{}.png".format(serial), "PMT (diff zfit) x axis")
-    plot_line(ydf, out_dir / "kor_diff_rel_y_{}.png".format(serial), "PMT (diff zfit) y axis")
+    plot_line(xdf, out_dir / "kor_diff_rel_x_{}.png".format(serial), "PMT (diff EMG) x axis")
+    plot_line(ydf, out_dir / "kor_diff_rel_y_{}.png".format(serial), "PMT (diff EMG) y axis")
 
     fig, ax = plt.subplots(figsize=(7.5, 4.6), dpi=170)
     ax.errorbar(
@@ -218,7 +218,7 @@ def plot_kor_standard(args):
         lw=1.4,
         ms=4,
         capsize=2,
-        label="PMT (diff zfit) x axis",
+        label="PMT (diff EMG) x axis",
     )
     ax.errorbar(
         ydf["theta_signed"],
@@ -228,7 +228,7 @@ def plot_kor_standard(args):
         lw=1.4,
         ms=4,
         capsize=2,
-        label="PMT (diff zfit) y axis",
+        label="PMT (diff EMG) y axis",
     )
     ax.axhline(1.0, ls="--", c="gray", lw=1)
     ax.set_xlabel("theta (deg)")

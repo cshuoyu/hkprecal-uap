@@ -2,9 +2,39 @@
 
 from pathlib import Path
 
+import matplotlib as mpl
 import numpy as np
 
 
+FIT_STYLE = {
+    "font.family": "serif",
+    "font.serif": ["Times New Roman"],
+    "mathtext.fontset": "stix",
+    "text.usetex": False,
+    "axes.unicode_minus": False,  # This Times font lacks the Unicode minus glyph.
+}
+
+
+def charge_fit_text(out):
+    """Display peak gain, absolute SPE center and total Gaussian sigma (pC)."""
+    gain = float(out.get("gain_pedestal_subtracted", np.nan))
+    if np.isfinite(gain) and gain > 0:
+        mantissa, exponent = "{:.3e}".format(gain).split("e")
+        gain_text = r"{}\times10^{{{}}}".format(mantissa, int(exponent))
+    else:
+        gain_text = r"\mathrm{N/A}"
+    lines = [
+        r"$\mathrm{Gain}=" + gain_text + "$",
+        r"$\mu_{\mathrm{SPE}}=" + "{:.3f}".format(out.get("spe_mean", np.nan)) + r"\,\mathrm{pC}$",
+        r"$\sigma_{\mathrm{SPE}}=" + "{:.3f}".format(out.get("spe_sigma", np.nan)) + r"\,\mathrm{pC}$",
+    ]
+    chi2, ndf = out.get("chi2", np.nan), out.get("ndf", np.nan)
+    if np.isfinite(chi2) and np.isfinite(ndf) and ndf > 0:
+        lines.append(r"$\chi^2/\mathrm{ndf}=" + "{:.2f}".format(chi2 / ndf) + "$")
+    return lines
+
+
+@mpl.rc_context(FIT_STYLE)
 def save_fit_with_pull_plot(
     plt,
     out_png,
@@ -23,8 +53,8 @@ def save_fit_with_pull_plot(
     fig, (ax1, ax2) = plt.subplots(
         2, 1, gridspec_kw={"height_ratios": [4, 1]}, figsize=(10, 10)
     )
-    ax1.errorbar(centers, counts, yerr=yerr, fmt="ok", label="data")
-    ax1.plot(x_model, y_model, linewidth=2, label="model")
+    ax1.errorbar(centers, counts, yerr=yerr, fmt="ok", label="Data")
+    ax1.plot(x_model, y_model, linewidth=2, label="Total")
     ax1.set_xlim([float(xlim[0]), float(xlim[1])])
     ax1.set_ylabel(y_label)
     ax1.legend(loc="best")

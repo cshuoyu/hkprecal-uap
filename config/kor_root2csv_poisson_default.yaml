@@ -1,0 +1,15 @@
+# @package _global_
+# KOR v7 charge-fit profile. The pulse-height cut is used ONLY for SPE seeds.
+defaults:
+  - kor_root2csv_charge_default
+  - _self_
+
+poisson_gaussian: false
+charge_fit_statistic: kor_chi2
+charge_fit_nbins: 300
+charge_fit_range: [-5.0, 10.0]
+npe: 3
+inc_backscatter: true
+# Data-driven KOR prefit bounds replace the site-specific nominal-HV bounds.
+spe_mu_min_pc: null
+spe_mu_max_pc: null

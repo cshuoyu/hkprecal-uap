@@ -35,6 +35,7 @@ trigger_ch: auto
 charge_branch: pico
 charge_fit_range: [-2.0, 6.0]
 npe: 1
+poisson_gaussian: false  # Set true with npe: 3 to include Poisson-weighted 0-3 PE.
 inc_backscatter: false
 
 # SPE peak position constraint (pC). Keeps fit from running off to pedestal tail

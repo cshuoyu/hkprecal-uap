@@ -1,86 +1,74 @@
-"""
-zfit EMG fitter for timing-based analyses.
-The analysis method is rewritten from https://github.com/wihann00/HKAus_precal_analysis/tree/main. (Author: Wi Han Ng)
+"""EMG timing fits using NumPy/SciPy and iminuit.
+
+The analysis method follows https://github.com/wihann00/HKAus_precal_analysis
+(Author: Wi Han Ng). Signal/background yields refer to the selected time window.
 """
 
 import logging
-import os
-import re
-import warnings
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import exponnorm
 
 from . import common_math, fitter_interface, plot_utils
+from .fit_config import timing_configuration
 from uap.scan_reader import aus_reader, kor_reader
 from uap.tool import scan_prepare, window
 
 
 logger = logging.getLogger(__name__)
-plt = None
-tensorflow = None
-zfit = None
-z = None
-UAPEMG = None
-_RUNTIME_READY = False
 SAMPLE_NS = 2.0
 
 
-# Load heavy deps (zfit/tensorflow/matplotlib).
-def _ensure_runtime():
-    global plt, tensorflow, zfit, z, UAPEMG, _RUNTIME_READY
-    if _RUNTIME_READY:
-        return
-    try:
-        import matplotlib.pyplot as _plt
-        import tensorflow as _tensorflow
-        import zfit as _zfit
-        from zfit import z as _z
-    except Exception as exc:
-        raise RuntimeError(
-            "TimingEMGFitter requires zfit/tensorflow/matplotlib: {}".format(exc)
-        )
+def emg_pdf(x, mu, lambd, sigma, limits):
+    """EMG normalized inside limits; mu is the Gaussian location, not its mean."""
+    shape = 1. / (sigma * lambd)
+    lo, hi = limits
+    cdf = exponnorm.cdf([lo, hi], shape, loc=mu, scale=sigma)
+    if cdf[0] > .5:
+        sf = exponnorm.sf([lo, hi], shape, loc=mu, scale=sigma)
+        acceptance = sf[0] - sf[1]
+    else:
+        acceptance = cdf[1] - cdf[0]
+    if not np.isfinite(acceptance) or acceptance <= 0:
+        return np.full_like(np.asarray(x, dtype=float), np.nan)
+    # SciPy evaluates the EMG in log space, avoiding exp * erfc overflow.
+    return np.exp(exponnorm.logpdf(x, shape, loc=mu, scale=sigma) - np.log(acceptance))
 
-    plt = _plt
-    tensorflow = _tensorflow
-    zfit = _zfit
-    z = _z
-    logging.getLogger("tensorflow").setLevel(logging.ERROR)
-    try:
-        zfit.settings.changed_warnings.hesse_name = False
-    except Exception:
-        pass
 
-    # EMG PDF used for timing fit.
-    class _UAPEMG(zfit.pdf.BasePDF):
-        def __init__(self, obs, mu, lambd, sigma, extended=None, norm=None, name=None):
-            params = {"mu": mu, "lambd": lambd, "sigma": sigma}
-            super().__init__(
-                obs=obs, params=params, extended=extended, norm=norm, name=name
-            )
-
-        # Unnormalized EMG formula.
-        def _unnormalized_pdf(self, x):
-            x = z.unstack_x(x)
-            mu = self.params["mu"]
-            lambd = self.params["lambd"]
-            sigma = self.params["sigma"]
-            a = (mu + (lambd * (sigma**2)) - x) / (z.sqrt(2.0) * sigma)
-            b = 2 * mu + (lambd * (sigma**2)) - 2 * x
-            return (lambd / 2.0) * z.exp((lambd / 2.0) * b) * tensorflow.math.erfc(a)
-
-    UAPEMG = _UAPEMG
-    _RUNTIME_READY = True
+def timing_density(x, parameters, limits):
+    """Extended EMG plus the existing first-order Chebyshev background."""
+    p = parameters
+    density = p["sig_yield"] * emg_pdf(x, p["mu"], p["lambd"], p["sigma"], limits)
+    if "bkg_yield" in p:
+        lo, hi = limits
+        scaled_x = 2. * (np.asarray(x) - lo) / (hi - lo) - 1.
+        density = density + p["bkg_yield"] * (1. + p["coeff"] * scaled_x) / (hi - lo)
+    return density
 
 
 # Concrete fitter.
 class TimingEMGFitter(fitter_interface.BaseScanFitter):
-    # Store fitter options and create figure directory.
-    def __init__(self, method_name="fitandplot_emg", fig_dir=None, nbins=30):
-        _ensure_runtime()
+    FIT_FIELD_MAP = fitter_interface.BaseScanFitter.FIT_FIELD_MAP + [
+        ("fit_model", "fit_model"),
+        ("fit_statistic", "fit_statistic"),
+        ("fit_optimizer", "fit_optimizer"),
+        ("chi2", "chi2"),
+        ("ndf", "ndf"),
+        ("objective_value", "objective_value"),
+        ("prior_penalty", "prior_penalty"),
+        ("fit_converged", "fit_converged"),
+        ("fit_covariance_accurate", "fit_covariance_accurate"),
+        ("fit_parameters_at_limit", "fit_parameters_at_limit"),
+    ]
 
-        self.method_name = method_name
+    # Store fitter options and create figure directory.
+    def __init__(self, method_name="timing", fig_dir=None, nbins=30, fit_config=None):
+        self.method_name = "timing" if method_name == "fitandplot_emg" else method_name
+        self._explicit_config = fit_config is not None
+        self.fit_config = timing_configuration(fit_config)
         self.nbins = int(nbins)
         self.fig_dir = Path(fig_dir).resolve() if fig_dir else None
         if self.fig_dir:
@@ -89,41 +77,15 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
     # Select fit backend by method_name.
     def fit(self, request):
         method = self.method_name
-        if method == "fitandplot_emg":
+        if method == "timing":
             return self._fit_emg(request)
         raise RuntimeError("Unsupported built-in fit method: {}".format(method))
 
-    # Convert coord into a safe suffix for zfit parameter names.
-    @staticmethod
-    def _coord_key(coord):
-        if isinstance(coord, (tuple, list)):
-            txt = "_".join([str(x) for x in coord])
-        else:
-            txt = str(coord)
-        txt = re.sub(r"[^0-9A-Za-z_]+", "_", txt)
-        txt = txt.strip("_")
-        return txt or "coord"
-
-    # Read one parameter error from hesse() output.
-    @staticmethod
-    def _extract_err(hesse, param):
-        if hesse is None:
-            return np.nan
-        try:
-            entry = hesse[param]
-            if isinstance(entry, dict):
-                return float(entry.get("error", np.nan))
-            return float(getattr(entry, "error", np.nan))
-        except Exception:
-            return np.nan
-
     # Estimate FWHM from sampled fitted model curve.
-    def _compute_fwhm(self, model, data, size, xr):
+    def _compute_fwhm(self, model, xr):
         try:
             x = np.linspace(float(xr[0]), float(xr[1]), 1000)
-            y_model = np.asarray(zfit.run(model.pdf(x)), dtype=float)
-            area = float(zfit.run(data.data_range.area()))
-            y = y_model * float(size) / float(self.nbins) * area
+            y = np.asarray(model(x), dtype=float)
 
             if y.size == 0 or not np.isfinite(y).any():
                 logger.warning("[FWHM][WARN] invalid sampled model values, return NaN.")
@@ -176,7 +138,7 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
             return
 
         x = np.linspace(float(xr[0]), float(xr[1]), 1000)
-        y_model = np.asarray(zfit.run(model.pdf(x)), dtype=float)
+        y_model = np.asarray(model(x), dtype=float)
         area = float(xr[1] - xr[0])
         y = y_model * float(size) / float(self.nbins) * area
 
@@ -185,7 +147,7 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
         )
         centers = 0.5 * (edges[:-1] + edges[1:])
         y_exp = (
-            np.asarray(zfit.run(model.pdf(centers)), dtype=float)
+            np.asarray(model(centers), dtype=float)
             * float(size)
             / float(self.nbins)
             * area
@@ -231,6 +193,8 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
 
         fit_kwargs = dict(request.fit_kwargs or {})
         inc_bkg = bool(fit_kwargs.get("inc_bkg", True))
+        if self._explicit_config:
+            inc_bkg = bool(self.fit_config["model"]["background"])
 
         xr = (
             request.xr
@@ -242,10 +206,10 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
                 "Invalid fit range xr={}, data size={}".format(xr, data_np.size)
             )
 
-        coord_key = self._coord_key(request.coord)
-        obs = zfit.Space("x", limits=(float(xr[0]), float(xr[1])))
-        data = zfit.Data.from_numpy(obs=obs, array=data_np)
-        size = int(data_np.shape[0])
+        data_np = data_np[(data_np >= xr[0]) & (data_np <= xr[1])]
+        if data_np.size == 0:
+            raise RuntimeError("No finite timing data inside fit range.")
+        size = int(data_np.size)
 
         mu_guess = float(np.mean(data_np))
         if not np.isfinite(mu_guess):
@@ -260,79 +224,58 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
             mu_lo = mu_guess - 1.0
             mu_hi = mu_guess + 1.0
 
-        mu = zfit.Parameter("mu_{}".format(coord_key), mu_guess, mu_lo, mu_hi)
-        lambd = zfit.Parameter("lambd_{}".format(coord_key), 0.1, 0.005, 5.0)
-        sigma = zfit.Parameter(
-            "sigma_{}".format(coord_key), np.clip(sigma_guess, 0.2, 20.0), 0.2, 50.0
-        )
-
-        emg = UAPEMG(obs=obs, mu=mu, lambd=lambd, sigma=sigma)
-        emg_yield_naive = float(size) * 0.8
-        bkg_yield_naive = float(size) - emg_yield_naive
-
-        bkg_yield = None
-        coeffs = None
+        initial = dict(mu=mu_guess, lambd=.1, sigma=float(np.clip(sigma_guess, .2, 20.)))
+        limits = dict(mu=(mu_lo, mu_hi), lambd=(.005, 5.), sigma=(.2, 50.))
         if inc_bkg:
-            coeffs = [zfit.Parameter("coeff_0_{}".format(coord_key), 0.0, -2.0, 1.0)]
-            chebyshev = zfit.pdf.Chebyshev(obs=obs, coeffs=coeffs)
-
-            emg_yield = zfit.Parameter(
-                "emg_yield_{}".format(coord_key),
-                emg_yield_naive,
-                max(emg_yield_naive * 0.01, 1.0),
-                max(emg_yield_naive * 1.5, 2.0),
-                step_size=1,
-            )
-            emg_ext = emg.create_extended(emg_yield)
-
-            bkg_yield = zfit.Parameter(
-                "comb_bkg_yield_{}".format(coord_key),
-                max(bkg_yield_naive, 1.0),
-                0.0,
-                max(bkg_yield_naive * 2.5, 2.0),
-                step_size=1,
-            )
-            bkg_ext = chebyshev.create_extended(bkg_yield)
-            model = zfit.pdf.SumPDF([emg_ext, bkg_ext])
+            initial.update(sig_yield=size * .8, bkg_yield=max(size * .2, 1.), coeff=0.)
+            limits.update(sig_yield=(max(size * .008, 1.), max(size * 1.2, 2.)),
+                          bkg_yield=(0., max(size * .5, 2.)), coeff=(-2., 1.))
         else:
-            emg_yield = zfit.Parameter(
-                "emg_yield_{}".format(coord_key),
-                float(size),
-                0.0,
-                max(float(size) * 1.2, 2.0),
-                step_size=1,
-            )
-            model = emg.create_extended(emg_yield)
+            initial["sig_yield"] = float(size)
+            limits["sig_yield"] = (0., max(size * 1.2, 2.))
 
-        nll = zfit.loss.ExtendedUnbinnedNLL(model, data)
-        minimizer = zfit.minimize.Minuit()
-        result = minimizer.minimize(nll)
-        try:
-            hesse = result.hesse()
-        except Exception:
-            hesse = None
+        constraints, statistic = self.fit_config["constraints"], self.fit_config["statistic"]
+        physical = dict(mu=(None, None), lambd=(1e-8, None), sigma=(1e-8, None), sig_yield=(0., None))
+        if inc_bkg:
+            physical.update(bkg_yield=(0., None), coeff=(-1., 1.))
+        initial, limits = common_math.apply_constraints(initial, limits, constraints, physical)
+        cost = common_math.build_objective(
+            data_np, xr, tuple(initial), lambda x, p: timing_density(x, p, xr),
+            lambda p: p["sig_yield"] + p.get("bkg_yield", 0.), statistic, constraints["priors"])
+        result = common_math.minimize(cost, initial, limits, self.fit_config["optimizer"], constraints["fixed"])
+        p = result.values.to_dict()
+        errors = common_math.parameter_errors(result)
+        out = {
+            "mean": p["mu"], "lambda": p["lambd"], "sigma": p["sigma"],
+            "mu_err": errors["mu"], "std_err": errors["sigma"],
+            "lambd_err": errors["lambd"], "sig_yield": p["sig_yield"],
+            "sig_err": errors["sig_yield"], "bkg_yield": p.get("bkg_yield", np.nan),
+            "bkg_err": errors["bkg_yield"] if inc_bkg else np.nan,
+            **common_math.fit_quality(result),
+        }
+        if inc_bkg:
+            out["coeff"] = p["coeff"]
+        penalty = sum(cost.errordef * ((p[name] - mean) / sigma) ** 2
+                      for name, (mean, sigma) in constraints["priors"].items())
+        out.update(fit_model="emg", fit_statistic=statistic["name"], fit_optimizer="iminuit",
+                   objective_value=result.fval, prior_penalty=penalty,
+                   chi2=result.fval - penalty if statistic["name"] == "chi2" else np.nan,
+                   ndf=cost.ndata - result.nfit if statistic["name"] == "chi2" else np.nan)
 
-        out = {}
-        out["mean"] = float(zfit.run(mu.value()))
-        out["lambda"] = float(zfit.run(lambd.value()))
-        out["sigma"] = float(zfit.run(sigma.value()))
-        out["mu_err"] = self._extract_err(hesse, mu)
-        out["std_err"] = self._extract_err(hesse, sigma)
-        out["lambd_err"] = self._extract_err(hesse, lambd)
-        out["sig_yield"] = float(zfit.run(emg_yield.value()))
-        out["sig_err"] = self._extract_err(hesse, emg_yield)
-        out["bkg_yield"] = (
-            float(zfit.run(bkg_yield.value())) if bkg_yield is not None else np.nan
-        )
-        out["bkg_err"] = (
-            self._extract_err(hesse, bkg_yield) if bkg_yield is not None else np.nan
-        )
-        if coeffs:
-            out["coeff"] = float(zfit.run(coeffs[0].value()))
+        def model(x):
+            return timing_density(x, p, xr) / (p["sig_yield"] + p.get("bkg_yield", 0.))
 
-        out["FWHM"] = self._compute_fwhm(model, data, size, xr)
+        # Preserve the legacy full-model FWHM, including background.
+        out["FWHM"] = self._compute_fwhm(model, xr)
         self._make_plot(model, data_np, xr, size, out, request.plotname)
         return out
+
+    def _attach_main_fit_fields(self, row, fit_out):
+        super()._attach_main_fit_fields(row, fit_out)
+        if fit_out.get("fit_converged") is False:
+            row["fit_status"] = "warning_not_converged"
+        elif fit_out.get("fit_covariance_accurate") is False:
+            row["fit_status"] = "warning_covariance"
 
     # Build AUS relative columns (with optional SiPM normalization).
     def _apply_aus_relative_columns(self, df, use_sipm):

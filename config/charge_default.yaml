@@ -1,0 +1,43 @@
+# @package _global_
+# Acquisition system chooses a reader, not a fitting algorithm.
+hydra:
+  run:
+    dir: ${oc.env:UAP_HOME,.}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-root2csv-${system}-charge
+  job:
+    chdir: true
+
+system: kor
+input_dir: /home/shuoyu/Workspace/real-run-kor/outputs/v7-hv-20260901-165633/outputs/precal_prd_kor_run_20260830_021.root
+serial: EM6400
+channel: auto
+trigger_ch: auto
+max_files: 0
+charge_branch: auto
+charge_fit_range: [-5.0, 10.0]
+
+fit:
+  model:
+    name: spe_response
+    npe: 1
+    backscatter: false
+
+  constraints:
+    weights: poisson
+    prefit_bounds: true
+    bounds: {}
+    fixed: {}
+    priors: {}
+
+  statistic:
+    name: chi2
+    nbins: 300
+
+  optimizer:
+    name: iminuit
+    initialization: pulse_height
+    prefit_nbins: 300
+    strategy: 2
+    tolerance: 0.01
+    max_calls: 20000
+    multistart: true
+    yield_step: null
