@@ -20,7 +20,7 @@ serial: EL1635B
 # -----------------------------------------------------------------------------
 # Method
 # -----------------------------------------------------------------------------
-# Cut-based relative QE (no zfit fitting).
+# Cut-based relative QE (no spectrum fitting).
 fit_method: kor_relative_qe
 max_files: 0
 

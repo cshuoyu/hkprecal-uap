@@ -46,6 +46,7 @@ charge_fit_range: [-1.0, 6.0]
 # npe=2: include 2PE Gaussian (mean/sigma tied geometrically to SPE).
 # Backscatter on: models the shoulder between pedestal and SPE.
 npe: 2
+poisson_gaussian: false  # Optional Poisson weights for the Gaussian components.
 inc_backscatter: true
 
 # Tighten SPE position bound — data clearly peaks near 2.0 pC; narrower

@@ -16,11 +16,14 @@ def parse_auto_or_int(value, arg_name):
 
 
 def resolve_inputs(args, default_out_csv, file_pattern, empty_msg):
-    # Resolve input_dir/out_csv and discover matching ROOT files.
+    # input_dir accepts either one processed ROOT file or a scan directory.
     input_dir = Path(getattr(args, "input_dir", "")).resolve()
     out_csv = Path(getattr(args, "out_csv", default_out_csv)).resolve()
 
-    files = sorted(input_dir.glob(file_pattern))
+    if input_dir.is_file():
+        files = [input_dir] if input_dir.match(file_pattern) else []
+    else:
+        files = sorted(input_dir.glob(file_pattern))
     max_files = int(getattr(args, "max_files", 0) or 0)
     if max_files > 0:
         files = files[:max_files]
@@ -29,7 +32,7 @@ def resolve_inputs(args, default_out_csv, file_pattern, empty_msg):
     return input_dir, out_csv, files
 
 
-def make_fit_input(data, coord, plotname, xr, meta=None):
+def make_fit_input(data, coord, plotname, xr, meta=None, fit_kwargs=None):
     # Build one standard fit-input record.
     out = {
         "data": data,
@@ -39,6 +42,8 @@ def make_fit_input(data, coord, plotname, xr, meta=None):
     }
     if isinstance(meta, dict) and meta:
         out["meta"] = dict(meta)
+    if fit_kwargs:
+        out["fit_kwargs"] = dict(fit_kwargs)
     return out
 
 

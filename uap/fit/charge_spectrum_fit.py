@@ -1,88 +1,204 @@
-"""
-zfit charge-spectrum fitter for charge-based analyses.
+"""Charge-spectrum models and fits using NumPy/SciPy and iminuit.
 
-Current implementation:
-- KOR fixed method: pedestal Gaussian + SPE Gaussian + optional backscatter
-- AUS: interface reserved, not implemented yet
+The Gaussian-peak and SPE-response models support free or Poisson weights.
+Models, constraints, data statistics and optimizers are configured separately.
 """
 
 import logging
-import os
+import math
 import re
-import warnings
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import tensorflow
-import zfit
-from zfit import z
+from scipy.optimize import curve_fit
+from scipy.special import erf, ndtr
 
-from . import common_math, fitter_interface
+from . import common_math, fitter_interface, plot_utils
+from .fit_config import charge_configuration
 from uap.scan_reader import aus_reader, kor_reader
 from uap.tool import scan_prepare
 
 
 logger = logging.getLogger(__name__)
-logging.getLogger("tensorflow").setLevel(logging.ERROR)
-try:
-    zfit.settings.changed_warnings.hesse_name = False
-except Exception:
-    pass
 
 
-class KORBackscatterPDF(zfit.pdf.BasePDF):
-    def __init__(
-        self,
-        obs,
-        mu_ped,
-        sigma_ped,
-        mu_spe,
-        sigma_spe,
-        extended=None,
-        norm=None,
-        name=None,
-    ):
-        params = {
-            "mu_ped": mu_ped,
-            "sigma_ped": sigma_ped,
-            "mu_spe": mu_spe,
-            "sigma_spe": sigma_spe,
-        }
-        super().__init__(
-            obs=obs, params=params, extended=extended, norm=norm, name=name
-        )
+def gaussian_shapes(mu_ped, sigma_ped, mu_spe, sigma_spe, npe):
+    """Keep the legacy SPE width and tied 2/3-PE means and widths."""
+    n = np.arange(npe + 1)
+    means = mu_ped + n * (mu_spe - mu_ped)
+    sigmas = np.sqrt(sigma_ped ** 2 + n * max(sigma_spe ** 2 - sigma_ped ** 2, 1e-8))
+    sigmas[:2] = sigma_ped, sigma_spe
+    return means, sigmas
 
-    def _unnormalized_pdf(self, x):
-        x = z.unstack_x(x)
-        mu_ped = self.params["mu_ped"]
-        sigma_ped = self.params["sigma_ped"]
-        mu_spe = self.params["mu_spe"]
-        sigma_spe = self.params["sigma_spe"]
 
-        eps = tensorflow.constant(1e-6, dtype=x.dtype)
-        sigma_ped = tensorflow.maximum(sigma_ped, eps)
-        sigma_spe = tensorflow.maximum(sigma_spe, eps)
+def poisson_gaussian_yields(amplitude, mu, means, sigmas, limits):
+    """Poisson yields inside the fit window, not over the full real line."""
+    weights = np.array([np.exp(-mu) * mu ** n / math.factorial(n) for n in range(len(means))])
+    return amplitude * weights * common_math.gaussian_acceptance(limits, means, sigmas)
 
-        shape = tensorflow.math.erf((x - mu_ped) / sigma_ped) - tensorflow.math.erf(
-            (x - mu_spe) / sigma_spe
-        )
-        return tensorflow.maximum(shape, tensorflow.zeros_like(shape))
+
+def gaussian_pdf(x, mean, sigma):
+    return np.exp(-0.5 * ((np.asarray(x) - mean) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+
+
+def backscatter_pdf(x, mu_ped, sigma_ped, mu_spe, sigma_spe, limits):
+    """Legacy clipped erf-difference, normalized in the selected window."""
+    lo, hi = limits
+    # erf is monotonic: its difference changes sign at this single crossing.
+    if sigma_spe != sigma_ped:
+        crossing = (mu_ped * sigma_spe - mu_spe * sigma_ped) / (sigma_spe - sigma_ped)
+        if sigma_spe > sigma_ped:
+            lo = max(lo, crossing)
+        else:
+            hi = min(hi, crossing)
+
+    def primitive(q, mean, sigma):
+        u = (q - mean) / sigma
+        return (q - mean) * erf(u) + sigma / np.sqrt(np.pi) * np.exp(-u * u)
+
+    integral = (primitive(hi, mu_ped, sigma_ped) - primitive(lo, mu_ped, sigma_ped)
+                - primitive(hi, mu_spe, sigma_spe) + primitive(lo, mu_spe, sigma_spe))
+    if hi <= lo or integral <= 0:
+        return np.full_like(np.asarray(x, dtype=float), np.nan)
+    shape = erf((np.asarray(x) - mu_ped) / sigma_ped) - erf((np.asarray(x) - mu_spe) / sigma_spe)
+    return np.maximum(shape, 0.) / integral
+
+
+RESPONSE_PARAMETERS = ("amplitude", "mu", "pedestal", "spe_gain", "ped_sigma", "spe_sigma", "back_fraction")
+
+
+def response_parameters(parameters, npe, poisson=True):
+    """Free weights replace amplitude/occupancy without changing any peak shape."""
+    if poisson:
+        amplitude, mu, ped, gain, sig0, sig1, fraction = parameters
+        weights = [amplitude * np.exp(-mu) * mu ** n / math.factorial(n)
+                   for n in range(npe + 1)]
+    else:
+        weights = parameters[:npe + 1]
+        ped, gain, sig0, sig1, fraction = parameters[npe + 1:]
+    return weights, ped, gain, sig0, sig1, fraction
+
+
+def spe_response_components(x, parameters, npe, poisson=True):
+    """Return full-line Gaussian and backscatter densities, including yields."""
+    weights, ped, gain, sig0, sig1, back_fraction = response_parameters(parameters, npe, poisson)
+    x = np.asarray(x, dtype=float)
+    gaussians, backscatters = [], []
+    for n in range(npe + 1):
+        mean = ped + n * gain
+        sigma = np.sqrt(sig0 ** 2 + n * sig1 ** 2)
+        weight = weights[n]
+        gaussian = np.exp(-0.5 * ((x - mean) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+        gaussians.append(weight * gaussian * (1 - back_fraction if n else 1))
+        if n:
+            back = (erf((x - ped) / sig0) - erf((x - mean) / sigma)) / (2 * n * gain)
+            backscatters.append(weight * back_fraction * back)
+    return gaussians, backscatters
+
+
+def spe_response_model(x, parameters, npe, poisson=True):
+    gaussians, backscatters = spe_response_components(x, parameters, npe, poisson)
+    return np.sum(gaussians + backscatters, axis=0)
+
+
+def gaussian_histogram_prefit(counts, centers, limits):
+    keep = (centers >= limits[0]) & (centers <= limits[1]) & (counts > 0)
+    x, y = centers[keep], counts[keep].astype(float)
+    if len(x) < 4:
+        raise ValueError("Too few occupied bins for Gaussian histogram prefit")
+    mean = np.average(x, weights=y)
+    sigma = np.sqrt(np.average((x - mean) ** 2, weights=y))
+
+    def gaussian(x, amplitude, mean, sigma):
+        return amplitude * np.exp(-0.5 * ((x - mean) / sigma) ** 2)
+
+    parameters, _ = curve_fit(
+        gaussian, x, y, p0=(y.max(), mean, sigma), sigma=np.sqrt(y),
+        absolute_sigma=True, maxfev=20000,
+    )
+    return float(parameters[1]), float(abs(parameters[2]))
+
+
+def pulse_height_initial_parameters(counts, selected_counts, centers):
+    ped, sig0 = gaussian_histogram_prefit(counts, centers, (-2.0, 0.9))
+    peak = centers[np.argmax(selected_counts)]
+    width = max(peak * 0.5, 2.5)
+    spe, sigma = gaussian_histogram_prefit(selected_counts, centers, (peak - width, peak + width))
+    width = sigma * 0.5
+    if width < 2.0:
+        width = 2.5
+    spe, sigma = gaussian_histogram_prefit(selected_counts, centers, (spe - width, spe + width))
+    gain = spe - ped
+    if gain <= 0 or sig0 <= 0:
+        raise ValueError("Charge prefit did not resolve a positive SPE charge step")
+    if sigma > gain * 0.4:
+        sigma = gain * 0.35
+    return ped, sig0, gain, sigma
+
+
+def spe_response_yields(parameters, limits, npe, poisson=True):
+    """Integrals in the selected charge range; not full-spectrum event counts."""
+    weights, ped, gain, sig0, sig1, fraction = response_parameters(parameters, npe, poisson)
+    lo, hi = limits
+    gaussians, back = [], 0.0
+
+    def erf_integral(x, mean, sigma):
+        u = (x - mean) / sigma
+        return (x - mean) * erf(u) + sigma / np.sqrt(np.pi) * np.exp(-u * u)
+
+    for n in range(npe + 1):
+        mean, sigma = ped + n * gain, np.sqrt(sig0 ** 2 + n * sig1 ** 2)
+        weight = weights[n]
+        acceptance = ndtr((hi - mean) / sigma) - ndtr((lo - mean) / sigma)
+        gaussians.append(weight * acceptance * (1 - fraction if n else 1))
+        if n:
+            integral = (erf_integral(hi, ped, sig0) - erf_integral(lo, ped, sig0)
+                        - erf_integral(hi, mean, sigma) + erf_integral(lo, mean, sigma)) / (2 * n * gain)
+            back += weight * fraction * integral
+    return np.array(gaussians + [back])
 
 
 E_CHARGE_PC = 1.602176634e-7
-CHARGE_METHOD_NAME = "fitandplot_kor_charge"
-CHARGE_AUS_METHOD_NAME = "fitandplot_aus_charge"
-CHARGE_METHOD_NAMES = (CHARGE_METHOD_NAME, CHARGE_AUS_METHOD_NAME)
+CHARGE_METHOD_NAME = "charge"
+# Accepted only for historical configs; models never depend on acquisition system.
+CHARGE_METHOD_NAMES = (CHARGE_METHOD_NAME, "fitandplot_kor_charge", "fitandplot_aus_charge")
 SAMPLE_NS = 2.0
-LEGACY_KOR_PED_WINDOW_WIDTH = 2.9
-LEGACY_KOR_SPE_WINDOW_WIDTH = 1.3
-LEGACY_KOR_PEAK_SEPARATION = 2.3
+SPECTRUM_PED_WINDOW_WIDTH = 2.9
+SPECTRUM_SPE_WINDOW_WIDTH = 1.3
+SPECTRUM_PEAK_SEPARATION = 2.3
 
 
 class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
     FIT_FIELD_MAP = [
+        ("fit_model", "fit_model"),
+        ("fit_weights", "fit_weights"),
+        ("fit_statistic", "fit_statistic"),
+        ("fit_optimizer", "fit_optimizer"),
         ("npe", "npe"),
+        ("poisson_gaussian", "poisson_gaussian"),
+        ("poisson_mu", "poisson_mu"),
+        ("poisson_mu_err", "poisson_mu_err"),
+        ("charge_fit_statistic", "charge_fit_statistic"),
+        ("spe_charge_step", "spe_charge_step"),
+        ("spe_charge_step_err", "spe_charge_step_err"),
+        ("spe_sigma_intrinsic", "spe_sigma_intrinsic"),
+        ("spe_sigma_intrinsic_err", "spe_sigma_intrinsic_err"),
+        ("gain_pedestal_subtracted", "gain_pedestal_subtracted"),
+        ("gain_pedestal_subtracted_err", "gain_pedestal_subtracted_err"),
+        ("backscatter_fraction", "backscatter_fraction"),
+        ("backscatter_fraction_err", "backscatter_fraction_err"),
+        ("chi2", "chi2"),
+        ("ndf", "ndf"),
+        ("objective_value", "objective_value"),
+        ("prior_penalty", "prior_penalty"),
+        ("fit_converged", "fit_converged"),
+        ("fit_covariance_accurate", "fit_covariance_accurate"),
+        ("fit_parameters_at_limit", "fit_parameters_at_limit"),
+        ("seed_ped_mean", "seed_ped_mean"),
+        ("seed_ped_sigma", "seed_ped_sigma"),
+        ("seed_charge_step", "seed_charge_step"),
         ("ped_mean", "ped_mean"),
         ("ped_mean_err", "ped_mean_err"),
         ("ped_sigma", "ped_sigma"),
@@ -129,11 +245,34 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         spe_mu_max_pc=2.5,
         spe_mu_prior=None,
         spe_sigma_prior=None,
+        poisson_gaussian=False,
+        charge_fit_statistic="unbinned_nll",
+        charge_fit_nbins=300,
+        fit_config=None,
     ):
-        self.method_name = str(method_name or CHARGE_METHOD_NAME).strip()
+        method = str(method_name or CHARGE_METHOD_NAME).strip()
+        self.method_name = CHARGE_METHOD_NAME if method in CHARGE_METHOD_NAMES else method
         self.nbins = int(nbins)
-        self.inc_backscatter = bool(inc_backscatter)
-        self.npe = int(npe) if int(npe) in (1, 2, 3) else 2
+        self.fit_config = charge_configuration(fit_config, charge_fit_statistic,
+                                               poisson_gaussian, npe, inc_backscatter,
+                                               spe_mu_prior, spe_sigma_prior)
+        if fit_config is None:
+            self.fit_config["statistic"]["nbins"] = int(charge_fit_nbins)
+            self.fit_config["optimizer"]["prefit_nbins"] = int(charge_fit_nbins)
+        else:
+            # The four-section config owns its bounds; do not add old flat defaults.
+            spe_mu_min_pc = spe_mu_max_pc = None
+        self.model_name = self.fit_config["model"]["name"]
+        self.inc_backscatter = bool(self.fit_config["model"]["backscatter"])
+        self.npe = int(self.fit_config["model"]["npe"])
+        self.constraints = self.fit_config["constraints"]
+        self.poisson_gaussian = self.constraints["weights"] == "poisson"
+        self.statistic = self.fit_config["statistic"]
+        self.optimizer = self.fit_config["optimizer"]
+        self.charge_fit_statistic = self.statistic["name"]
+        self.charge_fit_nbins = int(self.statistic["nbins"])
+        if self.charge_fit_nbins < 20:
+            raise ValueError("fit.statistic.nbins must be at least 20")
         self.charge_branch = str(charge_branch or "auto")
         self.charge_qmin = charge_qmin
         self.charge_qmax = charge_qmax
@@ -153,11 +292,15 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             self.fig_dir.mkdir(parents=True, exist_ok=True)
 
     def fit(self, request):
-        if self.method_name in CHARGE_METHOD_NAMES:
-            return self._fit_kor_charge(request)
-        raise RuntimeError(
-            "Unsupported built-in charge fit method: {}".format(self.method_name)
-        )
+        if self.method_name != CHARGE_METHOD_NAME:
+            raise RuntimeError("Unsupported charge method: " + self.method_name)
+        if self.model_name == "spe_response":
+            out = self._fit_spe_response(request)
+        else:
+            out = self._fit_gaussian_peaks(request)
+        out.update(fit_model=self.model_name, fit_weights=self.constraints["weights"],
+                   fit_statistic=self.statistic["name"], fit_optimizer=self.optimizer["name"])
+        return out
 
     @staticmethod
     def _validate_prior(prior):
@@ -185,18 +328,6 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             txt = str(coord)
         txt = re.sub(r"[^0-9A-Za-z_]+", "_", txt).strip("_")
         return txt or "coord"
-
-    @staticmethod
-    def _extract_err(hesse, param):
-        if hesse is None or param is None:
-            return np.nan
-        try:
-            entry = hesse[param]
-            if isinstance(entry, dict):
-                return float(entry.get("error", np.nan))
-            return float(getattr(entry, "error", np.nan))
-        except Exception:
-            return np.nan
 
     @staticmethod
     def _finite_1d(values):
@@ -296,7 +427,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             return float(xmin), float(xmax)
         return float(lo), float(hi)
 
-    def _estimate_kor_seed_centers(self, data_np, xr):
+    def _estimate_seed_centers(self, data_np, xr):
         xmin, xmax = float(xr[0]), float(xr[1])
         span = max(float(xmax - xmin), 1e-6)
 
@@ -310,10 +441,10 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         )
 
         if not np.isfinite(spe_center) or spe_center <= ped_center:
-            fallback_center = ped_center + LEGACY_KOR_PEAK_SEPARATION
+            fallback_center = ped_center + SPECTRUM_PEAK_SEPARATION
             search_lo, search_hi = self._window_with_fixed_width(
                 fallback_center,
-                max(2.0 * LEGACY_KOR_SPE_WINDOW_WIDTH, 0.35 * span),
+                max(2.0 * SPECTRUM_SPE_WINDOW_WIDTH, 0.35 * span),
                 xmin,
                 xmax,
             )
@@ -334,14 +465,14 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             spe_center = float(min(xmax, ped_center + max(0.5, 0.25 * span)))
         return ped_center, spe_center
 
-    def _kor_seed_windows(self, data_np, xr):
+    def _seed_windows(self, data_np, xr):
         xmin, xmax = float(xr[0]), float(xr[1])
-        ped_center, spe_center = self._estimate_kor_seed_centers(data_np, xr)
+        ped_center, spe_center = self._estimate_seed_centers(data_np, xr)
         ped_min, ped_max = self._window_with_fixed_width(
-            ped_center, LEGACY_KOR_PED_WINDOW_WIDTH, xmin, xmax
+            ped_center, SPECTRUM_PED_WINDOW_WIDTH, xmin, xmax
         )
         spe_min, spe_max = self._window_with_fixed_width(
-            spe_center, LEGACY_KOR_SPE_WINDOW_WIDTH, xmin, xmax
+            spe_center, SPECTRUM_SPE_WINDOW_WIDTH, xmin, xmax
         )
         return ped_min, ped_max, spe_min, spe_max
 
@@ -374,25 +505,22 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         sigma_hi = max(float(sigma_guess * 3.0), float(0.5 * span), sigma_lo * 10.0)
 
         try:
-            obs = zfit.Space("x", limits=(float(xmin), float(xmax)))
-            data = zfit.Data.from_numpy(obs=obs, array=arr)
-            mu = zfit.Parameter(
-                "prefit_mu_{}_{}".format(label, coord_key),
-                float(np.clip(mu_guess, mu_lo, mu_hi)),
-                mu_lo,
-                mu_hi,
+            mean, variance = float(np.mean(arr)), float(np.var(arr))
+
+            def nll(mu, sigma):
+                acceptance = common_math.gaussian_acceptance((xmin, xmax), mu, sigma)
+                if acceptance <= 0:
+                    return np.inf
+                return arr.size * (np.log(sigma) + np.log(acceptance)
+                                   + 0.5 * (variance + (mean - mu) ** 2) / sigma ** 2)
+
+            result = common_math.minimize_nll(
+                nll,
+                dict(mu=float(np.clip(mu_guess, mu_lo, mu_hi)),
+                     sigma=float(np.clip(sigma_guess, sigma_lo, sigma_hi))),
+                dict(mu=(mu_lo, mu_hi), sigma=(sigma_lo, sigma_hi)),
             )
-            sigma = zfit.Parameter(
-                "prefit_sigma_{}_{}".format(label, coord_key),
-                float(np.clip(sigma_guess, sigma_lo, sigma_hi)),
-                sigma_lo,
-                sigma_hi,
-            )
-            model = zfit.pdf.Gauss(obs=obs, mu=mu, sigma=sigma)
-            nll = zfit.loss.UnbinnedNLL(model, data)
-            zfit.minimize.Minuit().minimize(nll)
-            mu_val = float(zfit.run(mu.value()))
-            sigma_val = float(zfit.run(sigma.value()))
+            mu_val, sigma_val = result.values["mu"], result.values["sigma"]
             if not np.isfinite(mu_val) or not np.isfinite(sigma_val) or sigma_val <= 0:
                 raise RuntimeError("non-finite gaussian prefit result")
             return {
@@ -412,7 +540,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
     def _initial_guesses(self, data_np, xr, coord_key):
         xmin, xmax = float(xr[0]), float(xr[1])
         span = max(xmax - xmin, 1e-6)
-        ped_min, ped_max, spe_min, spe_max = self._kor_seed_windows(data_np, xr)
+        ped_min, ped_max, spe_min, spe_max = self._seed_windows(data_np, xr)
 
         ped_prefit = self._prefit_gaussian_window(
             data_np, ped_min, ped_max, coord_key, "ped"
@@ -469,64 +597,25 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             return np.nan
         return peak_height / valley_height
 
-    @staticmethod
-    def _build_npe_shape_params(coord_key, mu_ped, sigma_ped, mu_spe, sigma_spe):
-        def pe_charge_step(mu_ped_val, mu_spe_val):
-            return mu_spe_val - mu_ped_val
-
-        def sigma_step(sigma_ped_val, sigma_spe_val):
-            return z.sqrt(
-                tensorflow.maximum(
-                    sigma_spe_val * sigma_spe_val - sigma_ped_val * sigma_ped_val,
-                    1e-8,
-                )
-            )
-
-        def pe2_mean(mu_ped_val, mu_spe_val):
-            return mu_ped_val + 2.0 * pe_charge_step(mu_ped_val, mu_spe_val)
-
-        def pe3_mean(mu_ped_val, mu_spe_val):
-            return mu_ped_val + 3.0 * pe_charge_step(mu_ped_val, mu_spe_val)
-
-        def pe2_sigma(sigma_ped_val, sigma_spe_val):
-            sig1 = sigma_step(sigma_ped_val, sigma_spe_val)
-            return z.sqrt(
-                tensorflow.maximum(
-                    sigma_ped_val * sigma_ped_val + 2.0 * sig1 * sig1,
-                    1e-8,
-                )
-            )
-
-        def pe3_sigma(sigma_ped_val, sigma_spe_val):
-            sig1 = sigma_step(sigma_ped_val, sigma_spe_val)
-            return z.sqrt(
-                tensorflow.maximum(
-                    sigma_ped_val * sigma_ped_val + 3.0 * sig1 * sig1,
-                    1e-8,
-                )
-            )
-        return {
-            "pe2_mean": zfit.ComposedParameter(
-                "pe2_mean_{}".format(coord_key),
-                pe2_mean,
-                params=[mu_ped, mu_spe],
-            ),
-            "pe3_mean": zfit.ComposedParameter(
-                "pe3_mean_{}".format(coord_key),
-                pe3_mean,
-                params=[mu_ped, mu_spe],
-            ),
-            "pe2_sigma": zfit.ComposedParameter(
-                "pe2_sigma_{}".format(coord_key),
-                pe2_sigma,
-                params=[sigma_ped, sigma_spe],
-            ),
-            "pe3_sigma": zfit.ComposedParameter(
-                "pe3_sigma_{}".format(coord_key),
-                pe3_sigma,
-                params=[sigma_ped, sigma_spe],
-            ),
-        }
+    def _gaussian_components(self, x, parameters, xr):
+        """Return event intensities and window yields for the unbinned model."""
+        p = parameters
+        means, sigmas = gaussian_shapes(
+            p["mu_ped"], p["sigma_ped"], p["mu_spe"], p["sigma_spe"], self.npe
+        )
+        acceptance = common_math.gaussian_acceptance(xr, means, sigmas)
+        if self.poisson_gaussian:
+            yields = poisson_gaussian_yields(p["amplitude"], p["poisson_mu"], means, sigmas, xr)
+        else:
+            yields = np.array([p[name + "_yield"] for name in ("ped", "spe", "pe2", "pe3")[:self.npe + 1]])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            curves = [y * gaussian_pdf(x, mean, sigma) / acc
+                      for y, mean, sigma, acc in zip(yields, means, sigmas, acceptance)]
+        if self.inc_backscatter:
+            curves.append(p["bs_yield"] * backscatter_pdf(
+                x, p["mu_ped"], p["sigma_ped"], p["mu_spe"], p["sigma_spe"], xr))
+            yields = np.r_[yields, p["bs_yield"]]
+        return curves, yields
 
     @staticmethod
     def _canonicalize_gaussian_roles(out):
@@ -545,11 +634,12 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             )
         return True
 
+    @plt.rc_context(plot_utils.FIT_STYLE)
     def _make_log_plot(
         self, out_png, centers, counts, yerr, x_model, curves, xr, text_lines
     ):
         fig, ax = plt.subplots(1, 1, figsize=(10, 7))
-        ax.errorbar(centers, counts, yerr=yerr, fmt="ok", label="data")
+        ax.errorbar(centers, counts, yerr=yerr, fmt="ok", label="Data")
         for curve in curves:
             ax.plot(
                 x_model,
@@ -557,7 +647,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
                 linewidth=curve.get("linewidth", 2),
                 color=curve.get("color"),
                 linestyle=curve.get("linestyle", "-"),
-                label=curve["label"],
+                label=curve["label"][:1].upper() + curve["label"][1:],
             )
         ax.set_xlim([float(xr[0]), float(xr[1])])
         ax.set_xlabel("Charge (pC)")
@@ -599,7 +689,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             total_yield = float(np.asarray(data_np).size)
 
         x = np.linspace(float(xr[0]), float(xr[1]), 1200)
-        y_model = np.asarray(zfit.run(model.pdf(x)), dtype=float)
+        y_model = np.asarray(model(x), dtype=float)
         area = float(xr[1] - xr[0])
         y = y_model * total_yield / float(self.nbins) * area
 
@@ -607,19 +697,9 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             data_np, bins=self.nbins, range=(float(xr[0]), float(xr[1]))
         )
         centers = 0.5 * (edges[:-1] + edges[1:])
-        text_lines = [
-            "npe={}".format(int(out.get("npe", self.npe))),
-            "mu_spe={:.4g}".format(out.get("spe_mean", np.nan)),
-            "sigma_spe={:.4g}".format(out.get("spe_sigma", np.nan)),
-            "gain={:.4g}".format(out.get("gain", np.nan)),
-            "res={:.3g}%".format(out.get("resolution", np.nan)),
-        ]
-        if np.isfinite(out.get("backscatter_yield", np.nan)):
-            text_lines.append("bs={:.4g}".format(out.get("backscatter_yield", np.nan)))
-        if np.isfinite(out.get("peak_to_valley", np.nan)):
-            text_lines.append("P/V={:.3g}".format(out.get("peak_to_valley", np.nan)))
+        text_lines = plot_utils.charge_fit_text(out)
 
-        name = (plotname or "kor_charge_fit").strip()
+        name = (plotname or "charge_fit").strip()
         curves = [
             {
                 "label": "total",
@@ -636,7 +716,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             if comp_pdf is None:
                 continue
             comp_y = (
-                np.asarray(zfit.run(comp_pdf.pdf(x)), dtype=float)
+                np.asarray(comp_pdf(x), dtype=float)
                 * comp_yield
                 / float(self.nbins)
                 * area
@@ -664,7 +744,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         )
         logger.info("[PLOT] saved %s", log_target)
 
-    def _fit_kor_charge(self, request):
+    def _fit_gaussian_peaks(self, request):
         data_np = self._finite_1d(request.data)
         xr = request.xr
         if xr is None:
@@ -680,9 +760,18 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         if xmax <= xmin:
             raise RuntimeError("Invalid fit range xr={}".format(xr))
 
-        guesses = self._initial_guesses(data_np, xr, coord_key)
-        obs = zfit.Space("x", limits=(xmin, xmax))
-        data = zfit.Data.from_numpy(obs=obs, array=data_np)
+        if self.optimizer["initialization"] == "spectrum":
+            guesses = self._initial_guesses(data_np, xr, coord_key)
+        else:
+            selected = self._finite_1d(request.fit_kwargs.get("seed_charge", []))
+            if not len(selected):
+                raise ValueError("pulse_height initialization requires seed_charge")
+            counts, edges = np.histogram(data_np, bins=self.optimizer["prefit_nbins"], range=xr)
+            selected_counts, _ = np.histogram(selected, bins=edges)
+            ped, sig0, step, sig1 = pulse_height_initial_parameters(counts, selected_counts, .5 * (edges[1:] + edges[:-1]))
+            guesses = dict(mu_ped=ped, sigma_ped=sig0, mu_spe=ped + step,
+                           sigma_spe=np.sqrt(sig0 ** 2 + sig1 ** 2),
+                           ped_window=xr, spe_window=xr)
         size = int(data_np.shape[0])
 
         mu_ped_guess = guesses["mu_ped"]
@@ -729,251 +818,265 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         sigma_spe_lo = max(1e-4, float(0.5 * sigma_spe_guess))
         sigma_spe_hi = max(sigma_spe_lo * 1.2, float(2.0 * sigma_spe_guess), 0.15)
 
-        mu_ped = zfit.Parameter(
-            "mu_ped_{}".format(coord_key),
-            mu_ped_guess,
-            ped_mu_lo,
-            ped_mu_hi,
-        )
-        sigma_ped = zfit.Parameter(
-            "sigma_ped_{}".format(coord_key),
-            sigma_ped_guess,
-            sigma_ped_lo,
-            sigma_ped_hi,
-        )
-        mu_spe = zfit.Parameter(
-            "mu_spe_{}".format(coord_key),
-            float(np.clip(mu_spe_guess, spe_mu_lo, spe_mu_hi)),
-            spe_mu_lo,
-            spe_mu_hi,
-        )
-        sigma_spe = zfit.Parameter(
-            "sigma_spe_{}".format(coord_key),
-            sigma_spe_guess,
-            sigma_spe_lo,
-            sigma_spe_hi,
-        )
-        npe_shapes = self._build_npe_shape_params(
-            coord_key, mu_ped, sigma_ped, mu_spe, sigma_spe
-        )
-
-        ped_pdf = zfit.pdf.Gauss(obs=obs, mu=mu_ped, sigma=sigma_ped)
-        ped_yield = zfit.Parameter(
-            "ped_yield_{}".format(coord_key),
-            max(size * 0.5, 1.0),
-            0.0,
-            max(size * 1.2, 2.0),
-            step_size=1,
-        )
-        ped_ext = ped_pdf.create_extended(ped_yield)
-
-        spe_pdf = zfit.pdf.Gauss(obs=obs, mu=mu_spe, sigma=sigma_spe)
-        spe_yield = zfit.Parameter(
-            "spe_yield_{}".format(coord_key),
-            max(size * 0.3, 1.0),
-            0.0,
-            max(size * 1.2, 2.0),
-            step_size=1,
-        )
-        spe_ext = spe_pdf.create_extended(spe_yield)
-
-        components = [ped_ext, spe_ext]
-        pe2_yield = None
-        pe2_pdf = None
-        pe3_yield = None
-        pe3_pdf = None
-        if self.npe >= 2:
-            pe2_pdf = zfit.pdf.Gauss(
-                obs=obs,
-                mu=npe_shapes["pe2_mean"],
-                sigma=npe_shapes["pe2_sigma"],
-            )
-            pe2_yield = zfit.Parameter(
-                "pe2_yield_{}".format(coord_key),
-                max(size * 0.08, 1.0),
-                0.0,
-                max(size * 0.8, 2.0),
-                step_size=1,
-            )
-            components.append(pe2_pdf.create_extended(pe2_yield))
-        if self.npe >= 3:
-            pe3_pdf = zfit.pdf.Gauss(
-                obs=obs,
-                mu=npe_shapes["pe3_mean"],
-                sigma=npe_shapes["pe3_sigma"],
-            )
-            pe3_yield = zfit.Parameter(
-                "pe3_yield_{}".format(coord_key),
-                max(size * 0.03, 1.0),
-                0.0,
-                max(size * 0.6, 2.0),
-                step_size=1,
-            )
-            components.append(pe3_pdf.create_extended(pe3_yield))
-        bs_yield = None
-        bs_pdf = None
+        initial = dict(mu_ped=mu_ped_guess, sigma_ped=sigma_ped_guess,
+                       mu_spe=float(np.clip(mu_spe_guess, spe_mu_lo, spe_mu_hi)),
+                       sigma_spe=sigma_spe_guess)
+        limits = dict(mu_ped=(ped_mu_lo, ped_mu_hi), sigma_ped=(sigma_ped_lo, sigma_ped_hi),
+                      mu_spe=(spe_mu_lo, spe_mu_hi), sigma_spe=(sigma_spe_lo, sigma_spe_hi))
+        prefixes = ("ped", "spe", "pe2", "pe3")[:self.npe + 1]
+        if self.poisson_gaussian:
+            initial.update(amplitude=float(size), poisson_mu=0.1)
+            limits.update(amplitude=(0., None), poisson_mu=(0.001, 2.5))
+        else:
+            for prefix, fraction, upper in zip(prefixes, (.5, .3, .08, .03), (1.2, 1.2, .8, .6)):
+                initial[prefix + "_yield"] = max(size * fraction, 1.)
+                limits[prefix + "_yield"] = (0., max(size * upper, 2.))
         if self.inc_backscatter:
-            bs_pdf = KORBackscatterPDF(
-                obs=obs,
-                mu_ped=mu_ped,
-                sigma_ped=sigma_ped,
-                mu_spe=mu_spe,
-                sigma_spe=sigma_spe,
-            )
-            bs_yield = zfit.Parameter(
-                "bs_yield_{}".format(coord_key),
-                max(size * 0.05, 0.0),
-                0.0,
-                max(size * 0.8, 2.0),
-                step_size=1,
-            )
-            components.append(bs_pdf.create_extended(bs_yield))
+            initial["bs_yield"] = max(size * .05, 0.)
+            limits["bs_yield"] = (0., max(size * .8, 2.))
 
-        model = zfit.pdf.SumPDF(components)
-        constraints = []
-        if self.spe_mu_prior is not None:
-            mean, sigma = self.spe_mu_prior
-            constraints.append(zfit.constraint.GaussianConstraint(
-                params=mu_spe, observation=mean, uncertainty=sigma,
-            ))
-        if self.spe_sigma_prior is not None:
-            mean, sigma = self.spe_sigma_prior
-            constraints.append(zfit.constraint.GaussianConstraint(
-                params=sigma_spe, observation=mean, uncertainty=sigma,
-            ))
-        nll = zfit.loss.ExtendedUnbinnedNLL(
-            model, data, constraints=constraints if constraints else None
-        )
-        minimizer = zfit.minimize.Minuit()
-        result = minimizer.minimize(nll)
-        try:
-            hesse = result.hesse()
-        except Exception:
-            hesse = None
+        physical = {name: (0., None) for name in initial}
+        physical.update(mu_ped=xr, mu_spe=xr, sigma_ped=(1e-8, None), sigma_spe=(1e-8, None))
+        if self.poisson_gaussian:
+            physical["poisson_mu"] = (1e-8, None)
+        initial, limits = common_math.apply_constraints(initial, limits, self.constraints, physical)
+        names = tuple(initial)
 
+        def density(x, p):
+            return np.sum(self._gaussian_components(x, p, xr)[0], axis=0)
+
+        cost = common_math.build_objective(
+            data_np, xr, names, density, lambda p: self._gaussian_components(np.array([]), p, xr)[1].sum(),
+            self.statistic, self.constraints["priors"])
+        starts = None
+        if self.poisson_gaussian and self.optimizer["multistart"] and "poisson_mu" not in self.constraints["fixed"]:
+            occupancy = np.mean(data_np > .5 * (mu_ped_guess + mu_spe_guess))
+            starts = [dict(initial, poisson_mu=mu) for mu in (.1, float(np.clip(occupancy, *limits["poisson_mu"])))]
+        result = common_math.minimize(cost, initial, limits, self.optimizer, self.constraints["fixed"], starts)
+        p = result.values.to_dict()
+        errors = common_math.parameter_errors(result)
+        means, sigmas = gaussian_shapes(p["mu_ped"], p["sigma_ped"], p["mu_spe"], p["sigma_spe"], self.npe)
+        yields = self._gaussian_components(np.array([]), p, xr)[1]
+
+        def window_yields(values):
+            return self._gaussian_components(np.array([]), dict(zip(initial, values)), xr)[1]
+
+        yield_errors = common_math.propagated_errors(window_yields, list(result.values), result.covariance)
+        out = dict(npe=self.npe, poisson_gaussian=self.poisson_gaussian,
+                   poisson_mu=p.get("poisson_mu", np.nan),
+                   poisson_mu_err=errors["poisson_mu"] if self.poisson_gaussian else np.nan,
+                   charge_fit_statistic=self.charge_fit_statistic, **common_math.fit_quality(result))
+        out["objective_value"] = result.fval
+        out["prior_penalty"] = sum(cost.errordef * ((p[name] - mean) / sigma) ** 2
+                                   for name, (mean, sigma) in self.constraints["priors"].items())
+        out["chi2"] = result.fval - out["prior_penalty"] if self.charge_fit_statistic == "chi2" else np.nan
+        out["ndf"] = cost.ndata - result.nfit if self.charge_fit_statistic == "chi2" else np.nan
+        for i, prefix in enumerate(("ped", "spe", "pe2", "pe3")):
+            for suffix, values in (("mean", means), ("sigma", sigmas),
+                                   ("yield", yields), ("yield_err", yield_errors)):
+                out[prefix + "_" + suffix] = float(values[i]) if i <= self.npe else np.nan
+        for prefix in ("ped", "spe"):
+            out[prefix + "_mean_err"] = errors["mu_" + prefix]
+            out[prefix + "_sigma_err"] = errors["sigma_" + prefix]
+        out["backscatter_yield"] = float(yields[-1]) if self.inc_backscatter else np.nan
+        out["backscatter_yield_err"] = float(yield_errors[-1]) if self.inc_backscatter else np.nan
+
+        # Preserve the existing CSV definitions, including legacy absolute SPE gain.
+        swapped_roles = False if self.poisson_gaussian else self._canonicalize_gaussian_roles(out)
+        out["total_yield"] = float(np.sum(yields))
+        out["gain"] = out["spe_mean"] / E_CHARGE_PC
+        out["gain_err"] = out["spe_mean_err"] / E_CHARGE_PC
+        step_gradient = np.array([1. if name == "mu_spe" else -1. if name == "mu_ped" else 0.
+                                  for name in result.parameters])
+        variance = (step_gradient @ np.asarray(result.covariance) @ step_gradient
+                    if result.covariance is not None else np.nan)
+        out["spe_charge_step"] = out["spe_mean"] - out["ped_mean"]
+        out["spe_charge_step_err"] = np.sqrt(variance) if variance >= 0 else np.nan
+        out["gain_pedestal_subtracted"] = out["spe_charge_step"] / E_CHARGE_PC
+        out["gain_pedestal_subtracted_err"] = out["spe_charge_step_err"] / E_CHARGE_PC
+        out["resolution"] = out["spe_sigma"] / out["spe_mean"] * 100. if out["spe_mean"] else np.nan
+        out["peak_to_valley"] = self._compute_peak_to_valley(data_np, xr, out["ped_mean"], out["spe_mean"])
+
+        def model(x):
+            curves, _ = self._gaussian_components(x, p, xr)
+            return np.sum(curves, axis=0) / out["total_yield"]
+
+        specs = []
+        labels = ["pedestal", "SPE", "2PE", "3PE"][:self.npe + 1]
+        if swapped_roles:
+            labels[:2] = labels[1], labels[0]
+        if self.inc_backscatter:
+            labels.append("backscatter")
+        for i, (label, color) in enumerate(zip(labels, ["tab:orange", "tab:green", "tab:purple", "tab:brown"][:self.npe + 1]
+                                              + (["tab:red"] if self.inc_backscatter else []))):
+            def component_pdf(x, i=i):
+                curves, _ = self._gaussian_components(x, p, xr)
+                return curves[i] / yields[i]
+            specs.append({"label": label, "pdf": component_pdf, "yield": yields[i], "color": color})
+        self._make_plot(model, data_np, xr, out, request.plotname, specs)
+        return out
+
+    def _fit_spe_response(self, request):
+        charge = self._clip_to_range(request.data, *request.xr)
+        if len(charge) < self.min_events:
+            raise ValueError("Too few events in the charge fit range")
+        counts, edges = np.histogram(charge, bins=self.charge_fit_nbins, range=request.xr)
+        centers, bin_width = .5 * (edges[:-1] + edges[1:]), edges[1] - edges[0]
+        selected = self._finite_1d(request.fit_kwargs.get("seed_charge", []))
+        if self.optimizer["initialization"] == "pulse_height":
+            if selected.size == 0:
+                raise ValueError("pulse_height initialization requires seed_charge from the same run")
+            seed_counts, seed_edges = np.histogram(charge, bins=self.optimizer["prefit_nbins"], range=request.xr)
+            selected_counts, _ = np.histogram(selected, bins=seed_edges)
+            ped, sig0, gain, sig1 = pulse_height_initial_parameters(
+                seed_counts, selected_counts, .5 * (seed_edges[:-1] + seed_edges[1:]))
+        else:
+            guesses = self._initial_guesses(charge, request.xr, self._coord_key(request.coord))
+            ped, sig0 = guesses["mu_ped"], guesses["sigma_ped"]
+            gain = guesses["mu_spe"] - ped
+            sig1 = np.sqrt(max(guesses["sigma_spe"] ** 2 - sig0 ** 2, 1e-8))
+        if gain <= 0:
+            raise ValueError("Initialization did not resolve a positive charge step")
+        low_gain = gain < 1.6
+        initial = dict(zip(RESPONSE_PARAMETERS,
+                           [len(charge) * bin_width, .1, ped, gain, sig0, sig1,
+                            .03 if low_gain else .08]))
+        limits = dict(zip(RESPONSE_PARAMETERS, [
+            (0, None), (.001, 2.5), (ped - sig0, ped + sig0),
+            (gain * (.85 if low_gain else .75), gain * (1.15 if low_gain else 1.25)),
+            (sig0 * .5, sig0 * 1.3),
+            (sig0 * (.8 if low_gain else .5), gain * (.45 if low_gain else .55)),
+            (0, .15 if low_gain else .35),
+        ]))
+        gain_lo, gain_hi = limits["spe_gain"]
+        if self.spe_mu_min_pc is not None:
+            gain_lo = max(gain_lo, self.spe_mu_min_pc - ped)
+        if self.spe_mu_max_pc is not None:
+            gain_hi = min(gain_hi, self.spe_mu_max_pc - ped)
+        if gain_lo >= gain_hi:
+            raise ValueError("SPE bounds do not overlap the prefit charge-step interval")
+        limits["spe_gain"] = (gain_lo, gain_hi)
+        initial["spe_gain"] = float(np.clip(gain, gain_lo, gain_hi))
+        amplitude_names = ["amplitude"]
+        if not self.poisson_gaussian:
+            amplitude_names = [name + "_amplitude" for name in ("ped", "spe", "pe2", "pe3")[:self.npe + 1]]
+            weights = {name: initial["amplitude"] * np.exp(-.1) * .1 ** n / math.factorial(n)
+                       for n, name in enumerate(amplitude_names)}
+            initial = dict(weights, **{name: initial[name] for name in RESPONSE_PARAMETERS[2:]})
+            limits = dict({name: (0., None) for name in amplitude_names},
+                          **{name: limits[name] for name in RESPONSE_PARAMETERS[2:]})
+        physical = {name: (0., None) for name in initial}
+        physical.update(pedestal=tuple(request.xr), spe_gain=(1e-8, None),
+                        ped_sigma=(1e-8, None), spe_sigma=(1e-8, None), back_fraction=(0., 1.))
+        if self.poisson_gaussian:
+            physical["mu"] = (1e-8, None)
+        initial, limits = common_math.apply_constraints(initial, limits, self.constraints, physical)
+        fixed = dict(self.constraints["fixed"])
+        if not self.inc_backscatter:
+            if any("back_fraction" in self.constraints[section] for section in ("bounds", "priors")):
+                raise ValueError("back_fraction is inactive when model.backscatter=false")
+            if fixed.get("back_fraction", 0.) != 0.:
+                raise ValueError("model.backscatter=false requires back_fraction=0")
+            initial["back_fraction"] = 0.
+            fixed["back_fraction"] = 0.
+        names = tuple(initial)
+
+        def vector(p):
+            return np.array([p[name] for name in names])
+
+        def density_parameters(values):
+            values = np.asarray(values, dtype=float).copy()
+            for name in amplitude_names:
+                values[names.index(name)] /= bin_width
+            return values
+
+        def bin_prediction(x, p):
+            return spe_response_model(x, vector(p), self.npe, self.poisson_gaussian)
+
+        def density(x, p):
+            return spe_response_model(x, density_parameters(vector(p)), self.npe, self.poisson_gaussian)
+
+        def window_yields(values):
+            return spe_response_yields(density_parameters(values), request.xr, self.npe, self.poisson_gaussian)
+
+        cost = common_math.build_objective(
+            charge, request.xr, names, density, lambda p: window_yields(vector(p)).sum(),
+            self.statistic, self.constraints["priors"], bin_prediction=bin_prediction)
+        starts = [initial]
+        if self.poisson_gaussian and self.optimizer["multistart"] and "mu" not in fixed:
+            occupancy = len(selected) / len(charge) if len(selected) else .1
+            starts = [dict(initial, mu=mu) for mu in
+                      (.1, float(np.clip(occupancy, *limits["mu"])))]
+        result = common_math.minimize(cost, initial, limits, self.optimizer, fixed, starts)
+        parameters = np.array(list(result.values))
+        p = result.values.to_dict()
+        covariance = np.asarray(result.covariance) if result.covariance is not None else np.full((len(names), len(names)), np.nan)
+
+        def propagated(gradient):
+            variance = np.asarray(gradient) @ covariance @ np.asarray(gradient)
+            return float(np.sqrt(variance)) if variance >= 0 else np.nan
+
+        def gradient(**terms):
+            return [terms.get(name, 0.) for name in names]
+
+        ped, gain, sig0, sig1 = p["pedestal"], p["spe_gain"], p["ped_sigma"], p["spe_sigma"]
+        sigma_total = np.sqrt(sig0 ** 2 + sig1 ** 2)
+        mean_error = propagated(gradient(pedestal=1., spe_gain=1.))
+        sigma_error = propagated(gradient(ped_sigma=sig0 / sigma_total, spe_sigma=sig1 / sigma_total))
+        prior_penalty = sum(cost.errordef * ((p[name] - mean) / sigma) ** 2
+                            for name, (mean, sigma) in self.constraints["priors"].items())
         out = {
-            "npe": int(self.npe),
-            "ped_mean": float(zfit.run(mu_ped.value())),
-            "ped_mean_err": self._extract_err(hesse, mu_ped),
-            "ped_sigma": float(zfit.run(sigma_ped.value())),
-            "ped_sigma_err": self._extract_err(hesse, sigma_ped),
-            "ped_yield": float(zfit.run(ped_yield.value())),
-            "ped_yield_err": self._extract_err(hesse, ped_yield),
-            "spe_mean": float(zfit.run(mu_spe.value())),
-            "spe_mean_err": self._extract_err(hesse, mu_spe),
-            "spe_sigma": float(zfit.run(sigma_spe.value())),
-            "spe_sigma_err": self._extract_err(hesse, sigma_spe),
-            "spe_yield": float(zfit.run(spe_yield.value())),
-            "spe_yield_err": self._extract_err(hesse, spe_yield),
-            "pe2_mean": (
-                float(zfit.run(npe_shapes["pe2_mean"].value()))
-                if self.npe >= 2
-                else np.nan
-            ),
-            "pe2_sigma": (
-                float(zfit.run(npe_shapes["pe2_sigma"].value()))
-                if self.npe >= 2
-                else np.nan
-            ),
-            "pe2_yield": (
-                float(zfit.run(pe2_yield.value())) if pe2_yield is not None else np.nan
-            ),
-            "pe2_yield_err": (
-                self._extract_err(hesse, pe2_yield) if pe2_yield is not None else np.nan
-            ),
-            "pe3_mean": (
-                float(zfit.run(npe_shapes["pe3_mean"].value()))
-                if self.npe >= 3
-                else np.nan
-            ),
-            "pe3_sigma": (
-                float(zfit.run(npe_shapes["pe3_sigma"].value()))
-                if self.npe >= 3
-                else np.nan
-            ),
-            "pe3_yield": (
-                float(zfit.run(pe3_yield.value())) if pe3_yield is not None else np.nan
-            ),
-            "pe3_yield_err": (
-                self._extract_err(hesse, pe3_yield) if pe3_yield is not None else np.nan
-            ),
-            "backscatter_yield": (
-                float(zfit.run(bs_yield.value())) if bs_yield is not None else np.nan
-            ),
-            "backscatter_yield_err": (
-                self._extract_err(hesse, bs_yield) if bs_yield is not None else np.nan
-            ),
+            "npe": self.npe, "poisson_gaussian": self.poisson_gaussian,
+            "charge_fit_statistic": self.charge_fit_statistic,
+            "poisson_mu": p.get("mu", np.nan),
+            "poisson_mu_err": result.errors["mu"] if self.poisson_gaussian else np.nan,
+            "ped_mean": ped, "ped_mean_err": result.errors["pedestal"],
+            "ped_sigma": sig0, "ped_sigma_err": result.errors["ped_sigma"],
+            "spe_mean": ped + gain, "spe_mean_err": mean_error,
+            "spe_sigma": sigma_total, "spe_sigma_err": sigma_error,
+            "spe_sigma_intrinsic": sig1, "spe_sigma_intrinsic_err": result.errors["spe_sigma"],
+            "spe_charge_step": gain, "spe_charge_step_err": result.errors["spe_gain"],
+            "gain": (ped + gain) / E_CHARGE_PC, "gain_err": mean_error / E_CHARGE_PC,
+            "gain_pedestal_subtracted": gain / E_CHARGE_PC,
+            "gain_pedestal_subtracted_err": result.errors["spe_gain"] / E_CHARGE_PC,
+            "backscatter_fraction": p["back_fraction"],
+            "backscatter_fraction_err": result.errors["back_fraction"],
+            "resolution": sig1 / gain * 100.,
+            "chi2": result.fval - prior_penalty if self.charge_fit_statistic == "chi2" else np.nan,
+            "ndf": cost.ndata - result.nfit if self.charge_fit_statistic == "chi2" else np.nan,
+            "objective_value": result.fval, "prior_penalty": prior_penalty,
+            "seed_ped_mean": initial["pedestal"], "seed_ped_sigma": initial["ped_sigma"],
+            "seed_charge_step": initial["spe_gain"], **common_math.fit_quality(result),
         }
-        swapped_roles = self._canonicalize_gaussian_roles(out)
-        out["total_yield"] = float(
-            np.nansum(
-                [
-                    out["ped_yield"],
-                    out["spe_yield"],
-                    out["pe2_yield"],
-                    out["pe3_yield"],
-                    out["backscatter_yield"],
-                ]
-            )
-        )
-        out["gain"] = float(out["spe_mean"] / E_CHARGE_PC)
-        out["gain_err"] = (
-            float(out["spe_mean_err"] / E_CHARGE_PC)
-            if np.isfinite(out["spe_mean_err"])
-            else np.nan
-        )
-        out["resolution"] = (
-            float(out["spe_sigma"] / out["spe_mean"] * 100.0)
-            if np.isfinite(out["spe_mean"]) and out["spe_mean"] != 0
-            else np.nan
-        )
-        out["peak_to_valley"] = self._compute_peak_to_valley(
-            data_np, xr, out["ped_mean"], out["spe_mean"]
-        )
+        yields = window_yields(parameters)
+        jacobian = np.empty((len(yields), len(parameters)))
+        for i, value in enumerate(parameters):
+            step = 1e-5 * max(abs(value), 1e-3)
+            plus, minus = parameters.copy(), parameters.copy()
+            plus[i] += step
+            minus[i] -= step
+            jacobian[:, i] = (window_yields(plus) - window_yields(minus)) / (2 * step)
+        for n, prefix in enumerate(("ped", "spe", "pe2", "pe3")[:self.npe + 1]):
+            out[prefix + "_yield"] = yields[n]
+            out[prefix + "_yield_err"] = propagated(jacobian[n])
+            if n >= 2:
+                out[prefix + "_mean"] = ped + n * gain
+                out[prefix + "_sigma"] = np.sqrt(sig0 ** 2 + n * sig1 ** 2)
+        out["backscatter_yield"], out["backscatter_yield_err"] = yields[-1], propagated(jacobian[-1])
+        out["total_yield"] = float(yields.sum())
+        out["peak_to_valley"] = np.nan
 
-        component_specs = [
-            {
-                "label": "pedestal",
-                "pdf": spe_pdf if swapped_roles else ped_pdf,
-                "yield": out["ped_yield"],
-                "color": "tab:orange",
-            },
-            {
-                "label": "SPE",
-                "pdf": ped_pdf if swapped_roles else spe_pdf,
-                "yield": out["spe_yield"],
-                "color": "tab:green",
-            },
-        ]
-        if pe2_pdf is not None:
-            component_specs.append(
-                {
-                    "label": "2PE",
-                    "pdf": pe2_pdf,
-                    "yield": out["pe2_yield"],
-                    "color": "tab:purple",
-                }
-            )
-        if pe3_pdf is not None:
-            component_specs.append(
-                {
-                    "label": "3PE",
-                    "pdf": pe3_pdf,
-                    "yield": out["pe3_yield"],
-                    "color": "tab:brown",
-                }
-            )
-        if bs_pdf is not None:
-            component_specs.append(
-                {
-                    "label": "backscatter",
-                    "pdf": bs_pdf,
-                    "yield": out["backscatter_yield"],
-                    "color": "tab:red",
-                }
-            )
-
-        self._make_plot(model, data_np, xr, out, request.plotname, component_specs)
+        if self.fig_dir is not None:
+            xx = np.linspace(*request.xr, 1500)
+            gaussians, backscatters = spe_response_components(xx, parameters, self.npe, self.poisson_gaussian)
+            curves = [{"label": "total", "y": np.sum(gaussians + backscatters, axis=0), "color": "tab:blue"}]
+            for name, curve, color in zip(("pedestal", "SPE", "2PE", "3PE"), gaussians, ("tab:orange", "tab:green", "tab:purple", "tab:brown")):
+                curves.append({"label": name, "y": curve, "color": color, "linestyle": "--"})
+            if self.inc_backscatter:
+                curves.append({"label": "backscatter", "y": np.sum(backscatters, axis=0), "color": "tab:red", "linestyle": "--"})
+            notes = plot_utils.charge_fit_text(out)
+            target = self.fig_dir / ((request.plotname or "spe_response") + "_log.png")
+            self._make_log_plot(target, centers, counts, np.sqrt(np.maximum(counts, 1)), xx, curves, request.xr, notes)
         return out
 
     @staticmethod
@@ -996,6 +1099,15 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         if float(fit_out.get("spe_mean", 0.0)) <= float(fit_out.get("ped_mean", 0.0)):
             return True
         return False
+
+    def _attach_main_fit_fields(self, row, fit_out):
+        super()._attach_main_fit_fields(row, fit_out)
+        if fit_out.get("fit_converged") is False:
+            row["fit_status"] = "warning_not_converged"
+        elif fit_out.get("fit_covariance_accurate") is False:
+            row["fit_status"] = "warning_covariance"
+        elif {"spe_gain", "mu_spe"} & set(fit_out.get("fit_parameters_at_limit", "").split(";")):
+            row["fit_status"] = "warning_gain_at_limit"
 
     def _apply_kor_relative_columns(self, df):
         out_df = df.copy()
@@ -1059,6 +1171,10 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         return out_df
 
     def _prepare_aus_input(self, args):
+        if self.optimizer["initialization"] == "pulse_height":
+            raise ValueError("This reader has no saved pulse-height seed threshold; "
+                             "use fit.optimizer.initialization=spectrum")
+
         _input_dir, out_csv, files = self.resolve_inputs(
             args=args,
             default_out_csv="csv/aus_charge_results.csv",
@@ -1215,13 +1331,13 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         _input_dir, out_csv, files = self.resolve_inputs(
             args=args,
             default_out_csv="csv/kor_charge_results.csv",
-            file_pattern="prd_*.root",
-            empty_msg="No prd_*.root found in {}",
+            file_pattern="*prd_*.root",
+            empty_msg="No *prd_*.root found in {}",
         )
 
         selected = []
         for fp in files:
-            parsed = kor_reader.extract_serial_block_angles(fp.name, args.serial)
+            parsed = kor_reader.extract_serial_block_angles(fp, args.serial)
             if parsed is None:
                 continue
             phi, theta_raw = parsed
@@ -1274,6 +1390,13 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         points = []
 
         for idx, (fp, phi, theta_raw) in enumerate(selected):
+            fit_kwargs = {}
+            seed_threshold = np.nan
+            if self.optimizer["initialization"] == "pulse_height":
+                if charge_branch != "pico":
+                    raise ValueError("Pulse-height initialization expects the pico branch in pC")
+                seed_charge, seed_threshold = kor_reader.read_charge_seed(fp, ctx["channel"])
+                fit_kwargs["seed_charge"] = seed_charge
             charge = self.run_step(
                 lambda: kor_reader.read_tree_branch(fp, ctx["channel"], charge_branch),
                 stats=prep_stats,
@@ -1323,6 +1446,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
                 "charge_range_min": float(use_qmin),
                 "charge_range_max": float(use_qmax),
                 "charge_peak": float(peak),
+                "seed_threshold_mv": seed_threshold,
             }
 
             points.append(
@@ -1342,6 +1466,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
                         ),
                         xr=(use_qmin, use_qmax),
                         meta={"n_in_window": int(fit_values.size)},
+                        fit_kwargs=fit_kwargs,
                     ),
                     main_skip_msg="[SKIP] {}: KOR charge fit failed.".format(fp.name),
                 )
@@ -1373,3 +1498,8 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             }
 
         raise RuntimeError("Unsupported system: {}".format(system))
+
+# Deprecated names for external validation scripts; all fitting uses generic functions.
+kor_charge_components = spe_response_components
+kor_charge_model = spe_response_model
+kor_component_yields = spe_response_yields

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Unified CLI entrypoint for UAP pipelines."""
 
+import json
 import logging
 import sys
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
 
 import hydra
 from omegaconf import OmegaConf
@@ -63,7 +65,17 @@ def _run_hydra_with_config(config_name, overrides, runner_func):
 
 
 def _run_root2csv_hydra(argv):
+    parser = ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--input-dir", metavar="ROOT_OR_DIRECTORY")
+    parser.add_argument("--serial")
+    options, argv = parser.parse_known_args(argv)
     config_name, overrides = _extract_config_name(argv, "aus_root2csv_default")
+    if options.input_dir is not None:
+        # Resolve before Hydra changes the working directory; quote special characters.
+        source = str(Path(options.input_dir).expanduser().resolve())
+        overrides.append("input_dir=" + json.dumps(source, ensure_ascii=False))
+    if options.serial is not None:
+        overrides.append("serial=" + json.dumps(options.serial, ensure_ascii=False))
     _run_hydra_with_config(config_name, overrides, engine_root2csv.run)
 
 
@@ -97,7 +109,8 @@ def _print_help():
     print("  python3 main.py kor ...    # same as: root2csv kor ...")
     print("")
     print("Hydra mode:")
-    print("  python3 main.py root2csv   # use config/aus_root2csv_default.yaml by default")
+    print("  python3 main.py root2csv --config-name NAME --input-dir ROOT_OR_DIRECTORY [--serial SERIAL]")
+    print("  Outputs default to outputs/<date>/<time>-root2csv-<system>/")
     print("  python3 main.py csv2plot   # use config/csv2plot_default.yaml by default")
     print("  Add --config-name <yaml_without_ext> to switch profile")
 

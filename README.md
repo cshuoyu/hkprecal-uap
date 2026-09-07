@@ -58,7 +58,7 @@ hkprecal-uap/
   - Uniform point format, fit execution loop, status logging, CSV writing
   - Method-independent orchestration
 - `emg_timing_offset_fit.py`:
-  - Method-specific logic (zfit EMG fit)
+  - Method-specific logic (NumPy/SciPy EMG model, iminuit likelihood fit)
   - AUS/KOR input preparation
   - Relative quantity postprocessing
 
@@ -227,6 +227,34 @@ python3 runners/kor_cluster_runner.py --raw-dir /path/to/kor/raw --out-dir /path
 python3 main.py root2csv --config-name aus_root2csv_emg_default
 python3 main.py root2csv --config-name kor_root2csv_emg_default
 ```
+
+To fit one KOR processed ROOT file directly:
+
+```bash
+python main.py root2csv --config-name charge_default \
+  --input-dir /absolute/path/precal_prd_kor_run_20260815_011.root --serial EM6400
+```
+
+`--input-dir` accepts a file or a directory; no copy or symlink is needed.
+Relative paths supplied with this flag are resolved from the directory where the
+command starts, before Hydra changes directories. Directory inputs should contain
+one scan, not repeated angles at different HVs. `--serial` selects the PMT; it may
+be omitted if the selected YAML already specifies the correct serial.
+
+The existing defaults save CSV, fit figures, `main.log` and `.hydra/config.yaml`
+under `${UAP_HOME:-.}/outputs/<date>/<time>-root2csv-<system>/` (some profiles add
+`-charge`). No output-directory argument is needed. Existing `input_dir=...`,
+`serial=...` and other Hydra overrides remain supported; the explicit flags take
+precedence if both forms are supplied. Single-point results do not establish an
+angular dependence or an independently normalized relative QE.
+
+The new `charge_default` and `timing_default` profiles compose four independent
+sections: `fit.model`, `fit.constraints`, `fit.statistic`, `fit.optimizer`.
+For example, append `fit.constraints.weights=free` to release the Poisson weights,
+or `fit.model.backscatter=false` to remove backscatter without changing the
+statistic. `system` only selects the reader. Each run also saves the complete
+`fit_config.yaml`; see [Fit components](docs/fit_components.md) for definitions,
+parameter names, limits and backward compatibility.
 
 ### 4) CSV -> Plot (Hydra mode)
 ```bash

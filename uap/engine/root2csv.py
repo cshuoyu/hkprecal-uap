@@ -5,6 +5,8 @@ import argparse
 import logging
 from pathlib import Path
 
+import yaml
+
 from uap.fit.charge_spectrum_fit import (
     CHARGE_METHOD_NAME,
     CHARGE_METHOD_NAMES,
@@ -38,6 +40,11 @@ def _add_charge_args(parser):
         default=None,
     )
     parser.add_argument("--npe", type=int, choices=[1, 2, 3], default=2)
+    parser.add_argument("--poisson-gaussian", action="store_true",
+                        help="Tie Gaussian yields to Poisson weights (default: independent yields)")
+    parser.add_argument("--charge-fit-statistic", choices=["unbinned_nll", "chi2", "kor_chi2"],
+                        default="unbinned_nll", help="Legacy option; prefer the four-section fit config")
+    parser.add_argument("--charge-fit-nbins", type=int, default=300)
     parser.add_argument("--spe-mu-min-pc", type=float, default=1.0,
                         help="Lower bound on SPE peak position (pC). Default 1.0")
     parser.add_argument("--spe-mu-max-pc", type=float, default=2.5,
@@ -45,6 +52,9 @@ def _add_charge_args(parser):
 
 
 def build_fitter(args, out_csv_path):
+    fit_config = getattr(args, "fit", None)
+    if fit_config is not None:
+        args.fit_method = "timing" if fit_config["model"]["name"] == "emg" else "charge"
     fig_dir_arg = getattr(args, "fig_dir", "")
     fig_dir = (
         Path(fig_dir_arg).resolve()
@@ -79,6 +89,9 @@ def build_fitter(args, out_csv_path):
                 getattr(args, "inc_backscatter", getattr(args, "inc_bkg", True))
             ),
             npe=int(getattr(args, "npe", 2)),
+            poisson_gaussian=bool(getattr(args, "poisson_gaussian", False)),
+            charge_fit_statistic=getattr(args, "charge_fit_statistic", "unbinned_nll"),
+            charge_fit_nbins=int(getattr(args, "charge_fit_nbins", 300)),
             charge_branch=getattr(args, "charge_branch", "auto"),
             charge_qmin=qmin,
             charge_qmax=qmax,
@@ -86,11 +99,14 @@ def build_fitter(args, out_csv_path):
             spe_mu_max_pc=getattr(args, "spe_mu_max_pc", 2.5),
             spe_mu_prior=_prior_tuple(getattr(args, "spe_mu_prior", None)),
             spe_sigma_prior=_prior_tuple(getattr(args, "spe_sigma_prior", None)),
+            fit_config=fit_config,
         )
     nbins_arg = getattr(args, "plot_nbins", None)
     emg_kwargs = {"method_name": args.fit_method, "fig_dir": fig_dir}
     if nbins_arg:
         emg_kwargs["nbins"] = int(nbins_arg)
+    if fit_config is not None:
+        emg_kwargs["fit_config"] = fit_config
     return TimingEMGFitter(**emg_kwargs)
 
 
@@ -256,6 +272,8 @@ def _prepend_hydra_config_to_main_log(args):
 
 
 def run(args):
+    if getattr(args, "fit", None) is not None:
+        args.fit_method = "timing" if args.fit["model"]["name"] == "emg" else "charge"
     _prepare_output_layout(args)
     _ensure_main_log_file(args)
     _prepend_hydra_config_to_main_log(args)
@@ -269,6 +287,10 @@ def run(args):
     )
 
     fitter = build_fitter(args, args.out_csv)
+    if hasattr(fitter, "fit_config"):
+        config_path = Path(args.out_csv).resolve().parent.parent / "fit_config.yaml"
+        config_path.write_text(yaml.safe_dump(fitter.fit_config, sort_keys=False), encoding="utf-8")
+        logger.info("[FIT CONFIG] %s", fitter.fit_config)
     raw_df, out_df = fitter.run_scan_to_csv(system=args.system, args=args)
 
     logger.info("[DONE] system=%s rows_raw=%s rows_out=%s", args.system, len(raw_df), len(out_df))

@@ -102,8 +102,9 @@ python - <<'PY'
 import hydra
 import omegaconf
 import uproot
-import tensorflow
-import zfit
+import numpy
+import scipy
+import iminuit
 print("[ENV][OK] import check passed")
 PY
 

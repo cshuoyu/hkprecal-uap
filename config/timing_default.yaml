@@ -1,0 +1,40 @@
+# @package _global_
+hydra:
+  run:
+    dir: ${oc.env:UAP_HOME,.}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-root2csv-${system}-timing
+  job:
+    chdir: true
+
+system: kor
+input_dir: ???
+serial: ???
+channel: auto
+trigger_ch: auto
+max_files: 0
+tmin: 0
+tmax: 2048
+window_half_width: 30
+window_bin_width: 2.0
+plot_nbins: 30
+
+fit:
+  model:
+    name: emg
+    background: true
+  constraints:
+    prefit_bounds: true
+    bounds: {}
+    fixed: {}
+    priors: {}
+  statistic:
+    name: unbinned_nll
+    nbins: 30
+  optimizer:
+    name: iminuit
+    initialization: moments
+    prefit_nbins: 300
+    strategy: 1
+    tolerance: 0.1
+    max_calls: 20000
+    multistart: false
+    yield_step: 1.0
