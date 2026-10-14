@@ -1110,6 +1110,9 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
             row["fit_status"] = "warning_gain_at_limit"
 
     def _apply_kor_relative_columns(self, df):
+        # A stationary monitor has no position scan or angular center reference.
+        if "is_monitor" in df and df["is_monitor"].all():
+            return df.copy()
         out_df = df.copy()
         out_df["relative_gain"] = np.nan
         out_df["relative_gain_err"] = np.nan
@@ -1168,7 +1171,79 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
                 g0_err,
                 logger=logger,
             )
+        if "monitor_poisson_mu" in out_df:
+            out_df = self._apply_monitor_relative_columns(out_df)
         return out_df
+
+    @staticmethod
+    def _apply_monitor_relative_columns(df):
+        """Keep the charge occupancy ratio distinct from the legacy SPE-area proxy.
+
+        Errors neglect target/monitor covariance; all points share their center.
+        Bounds are review flags, not grounds for silently removing measurements.
+        """
+        out = df.copy()
+        mu, err = out.poisson_mu, out.poisson_mu_err
+        mon, mon_err = out.monitor_poisson_mu, out.monitor_poisson_mu_err
+        valid = (np.isfinite(mu) & np.isfinite(err) & np.isfinite(mon) & np.isfinite(mon_err)
+                 & (mu > 0) & (mon > 0) & (err >= 0) & (mon_err >= 0))
+        for prefix in ("", "monitor_"):
+            valid &= out[prefix + "fit_converged"].eq(True) & out[prefix + "fit_covariance_accurate"].eq(True)
+        out["charge_occupancy_ratio"] = (mu / mon).where(valid)
+        out["charge_occupancy_ratio_err"] = (out.charge_occupancy_ratio * np.sqrt(
+            (err / mu) ** 2 + (mon_err / mon) ** 2)).where(valid)
+        out["relative_charge_occupancy"] = np.nan
+        out["relative_charge_occupancy_err"] = np.nan
+        out["monitor_normalization_status"] = np.where(valid, "ok", "invalid_fit")
+        review = (out.fit_parameters_at_limit.fillna("").ne("")
+                  | out.monitor_fit_parameters_at_limit.fillna("").ne(""))
+        out["monitor_normalization_review"] = review | ~valid
+        for _, group in out.groupby("phi_raw"):
+            centers = group[group.theta_raw == 0]
+            idx = group.index
+            if len(centers) != 1:
+                out.loc[idx, "monitor_normalization_status"] = "missing_or_duplicate_center"
+                out.loc[idx, "monitor_normalization_review"] = True
+                continue
+            center = centers.iloc[0]
+            if not valid.loc[center.name]:
+                out.loc[idx, "monitor_normalization_status"] = "invalid_center"
+                out.loc[idx, "monitor_normalization_review"] = True
+                continue
+            relative = group.charge_occupancy_ratio / center.charge_occupancy_ratio
+            out.loc[idx, "relative_charge_occupancy"] = relative
+            out.loc[idx, "relative_charge_occupancy_err"] = relative * np.sqrt(
+                (group.charge_occupancy_ratio_err / group.charge_occupancy_ratio) ** 2
+                + (center.charge_occupancy_ratio_err / center.charge_occupancy_ratio) ** 2)
+            out.loc[center.name, "relative_charge_occupancy_err"] = 0.
+            out.loc[idx, "monitor_normalization_review"] |= bool(review.loc[center.name])
+        return out
+
+    def _monitor_charge_input(self, fp, channel, serial, charge_branch):
+        """Fit the same run's monitor with this fitter/config, without target cuts."""
+        order = kor_reader.extract_serial_order(fp)
+        if channel not in kor_reader.DEFAULT_SERIAL_ORDER_CHANNELS:
+            raise ValueError("monitor_ch must identify a PMT channel, not the trigger")
+        slot = kor_reader.DEFAULT_SERIAL_ORDER_CHANNELS.index(channel)
+        if slot >= len(order) or (serial and order[slot].upper() != str(serial).upper()):
+            raise ValueError("Monitor identity mismatch in {}: {}".format(fp, order))
+        charge = kor_reader.read_tree_branch(fp, channel, charge_branch)
+        qmin, qmax, _ = self._resolve_fit_range(self._finite_1d(charge))
+        values = self._clip_to_range(charge, qmin, qmax)
+        if values.size < self.min_events:
+            raise ValueError("Too few monitor events in {}".format(fp))
+        kwargs, threshold = {}, np.nan
+        if self.optimizer["initialization"] == "pulse_height":
+            seed, threshold = kor_reader.read_charge_seed(fp, channel)
+            kwargs["seed_charge"] = seed
+        fit_input = self.make_fit_input(
+            values, ("monitor_charge", str(fp), channel),
+            "monitor_charge_{}_{}".format(order[slot], fp.stem), (qmin, qmax),
+            meta={"n_in_window": int(values.size)}, fit_kwargs=kwargs)
+        metadata = dict(monitor_serial=order[slot], monitor_channel=channel,
+                        monitor_events=int(len(charge)), monitor_charge_range_min=qmin,
+                        monitor_charge_range_max=qmax, monitor_seed_threshold_mv=threshold)
+        return fit_input, metadata
 
     def _prepare_aus_input(self, args):
         if self.optimizer["initialization"] == "pulse_height":
@@ -1380,6 +1455,10 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
         )
 
         charge_branch = self._resolve_charge_branch("kor")
+        monitor_ch = getattr(args, "monitor_ch", None)
+        monitor_ch = int(monitor_ch) if monitor_ch is not None else None
+        if monitor_ch == ctx["trigger_ch"]:
+            raise ValueError("monitor_ch cannot be the trigger channel")
         prep_stats = {
             "files_scanned": int(len(selected)),
             "files_kept": 0,
@@ -1449,6 +1528,16 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
                 "seed_threshold_mv": seed_threshold,
             }
 
+            aux_blocks = []
+            if monitor_ch is not None:
+                row["is_monitor"] = monitor_ch == ctx["channel"]
+                if not row["is_monitor"]:
+                    monitor_input, metadata = self._monitor_charge_input(
+                        fp, monitor_ch, getattr(args, "monitor_serial", None), charge_branch)
+                    row.update(metadata)
+                    aux_blocks.append(dict(prefix="monitor", fit_input=monitor_input,
+                                           fit_fail_msg="Monitor charge fit failed: {}".format(fp.name)))
+
             points.append(
                 self.make_point(
                     row=row,
@@ -1469,6 +1558,7 @@ class ChargeSpectrumFitter(fitter_interface.BaseScanFitter):
                         fit_kwargs=fit_kwargs,
                     ),
                     main_skip_msg="[SKIP] {}: KOR charge fit failed.".format(fp.name),
+                    aux_blocks=aux_blocks,
                 )
             )
             prep_stats["files_kept"] += 1

@@ -1,0 +1,19 @@
+# @package _global_
+# Standard charge profile: apply the same model and BS bound to target/monitor.
+defaults:
+  - charge_default
+  - _self_
+
+input_dir: ???
+serial: ???
+monitor_ch: 0
+monitor_serial: EM2740
+
+fit:
+  model:
+    npe: 3
+    backscatter: true
+  constraints:
+    weights: poisson
+    bounds:
+      back_fraction: [0.0, 0.15]
