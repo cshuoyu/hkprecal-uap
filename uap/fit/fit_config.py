@@ -34,8 +34,10 @@ def resolve_fit_config(config):
         if unknown:
             raise ValueError("Unknown fit.{} options: {}".format(section, sorted(unknown)))
         result[section].update(deepcopy(dict(values)))
-    if result["statistic"]["name"] not in ("chi2", "unbinned_nll"):
-        raise ValueError("fit.statistic.name must be chi2 or unbinned_nll")
+    if result["statistic"]["name"] not in ("chi2", "unbinned_nll", "binned_nll"):
+        raise ValueError("fit.statistic.name must be chi2, unbinned_nll or binned_nll")
+    if result["statistic"]["name"] == "binned_nll" and name != "emg":
+        raise ValueError("binned_nll currently requires the emg model bin integral")
     if int(result["statistic"]["nbins"]) < 20:
         raise ValueError("fit.statistic.nbins must be at least 20")
     if int(result["optimizer"]["prefit_nbins"]) < 20:

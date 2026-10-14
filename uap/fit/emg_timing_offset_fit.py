@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import exponnorm
+from scipy.special import xlogy
 
 from . import common_math, fitter_interface, plot_utils
 from .fit_config import timing_configuration
@@ -49,6 +50,25 @@ def timing_density(x, parameters, limits):
     return density
 
 
+def timing_bin_expectations(edges, parameters, limits):
+    """Exact EMG/background integrals in event units, normalized to fit limits."""
+    p = parameters
+    shape = 1. / (p["sigma"] * p["lambd"])
+    points = np.concatenate((np.asarray(limits), np.asarray(edges)))
+    cdf = exponnorm.cdf(points, shape, loc=p["mu"], scale=p["sigma"])
+    sf = exponnorm.sf(points, shape, loc=p["mu"], scale=p["sigma"])
+    acceptance = sf[0] - sf[1] if cdf[0] > .5 else cdf[1] - cdf[0]
+    if not np.isfinite(acceptance) or acceptance <= 0:
+        return np.full(len(edges) - 1, np.nan)
+    probability = np.where(cdf[2:-1] > .5, -np.diff(sf[2:]), np.diff(cdf[2:]))
+    expected = p["sig_yield"] * probability / acceptance
+    if "bkg_yield" in p:
+        lo, hi = limits
+        scaled_center = (np.asarray(edges[:-1]) + edges[1:] - 2. * lo) / (hi - lo) - 1.
+        expected += p["bkg_yield"] * np.diff(edges) / (hi - lo) * (1. + p["coeff"] * scaled_center)
+    return expected
+
+
 # Concrete fitter.
 class TimingEMGFitter(fitter_interface.BaseScanFitter):
     FIT_FIELD_MAP = fitter_interface.BaseScanFitter.FIT_FIELD_MAP + [
@@ -57,6 +77,11 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
         ("fit_optimizer", "fit_optimizer"),
         ("chi2", "chi2"),
         ("ndf", "ndf"),
+        ("poisson_deviance", "poisson_deviance"),
+        ("diagnostic_ndf", "diagnostic_ndf"),
+        ("coeff", "coeff"),
+        ("sigma_err", "std_err"),
+        ("lambda_err", "lambd_err"),
         ("objective_value", "objective_value"),
         ("prior_penalty", "prior_penalty"),
         ("fit_converged", "fit_converged"),
@@ -133,26 +158,21 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
             return np.nan
 
     # Save one diagnostic fit plot (data/model + pull).
-    def _make_plot(self, model, data_np, xr, size, out, plotname):
+    def _make_plot(self, parameters, data_np, xr, out, plotname):
         if self.fig_dir is None:
             return
 
-        x = np.linspace(float(xr[0]), float(xr[1]), 1000)
-        y_model = np.asarray(model(x), dtype=float)
-        area = float(xr[1] - xr[0])
-        y = y_model * float(size) / float(self.nbins) * area
-
+        nbins = (int(self.fit_config["statistic"]["nbins"])
+                 if self.fit_config["statistic"]["name"] == "binned_nll" else self.nbins)
         counts, edges = np.histogram(
-            data_np, bins=self.nbins, range=(float(xr[0]), float(xr[1]))
+            data_np, bins=nbins, range=(float(xr[0]), float(xr[1]))
         )
         centers = 0.5 * (edges[:-1] + edges[1:])
-        y_exp = (
-            np.asarray(model(centers), dtype=float)
-            * float(size)
-            / float(self.nbins)
-            * area
-        )
+        y_exp = timing_bin_expectations(edges, parameters, xr)
+        # The displayed step and Pull use the same fitted-yield bin integrals.
+        x, y = np.repeat(edges, 2)[1:-1], np.repeat(y_exp, 2)
         pull = (counts - y_exp) / np.sqrt(np.clip(counts, 1, None))
+        pull_limit = max(5., float(np.max(np.abs(pull))) * 1.1)
 
         text = "mu={:.3g}".format(
             out.get("mean", np.nan),
@@ -180,7 +200,7 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
             text_lines=text_lines,
             y_label="Events",
             x_label="Time (ns)",
-            pull_ylim=(-5, 5),
+            pull_ylim=(-pull_limit, pull_limit),
         )
         logger.info("[PLOT] saved {}".format(target))
 
@@ -241,7 +261,8 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
         initial, limits = common_math.apply_constraints(initial, limits, constraints, physical)
         cost = common_math.build_objective(
             data_np, xr, tuple(initial), lambda x, p: timing_density(x, p, xr),
-            lambda p: p["sig_yield"] + p.get("bkg_yield", 0.), statistic, constraints["priors"])
+            lambda p: p["sig_yield"] + p.get("bkg_yield", 0.), statistic, constraints["priors"],
+            bin_integral=lambda edges, p: timing_bin_expectations(edges, p, xr))
         result = common_math.minimize(cost, initial, limits, self.fit_config["optimizer"], constraints["fixed"])
         p = result.values.to_dict()
         errors = common_math.parameter_errors(result)
@@ -260,14 +281,21 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
         out.update(fit_model="emg", fit_statistic=statistic["name"], fit_optimizer="iminuit",
                    objective_value=result.fval, prior_penalty=penalty,
                    chi2=result.fval - penalty if statistic["name"] == "chi2" else np.nan,
-                   ndf=cost.ndata - result.nfit if statistic["name"] == "chi2" else np.nan)
+                   ndf=cost.ndata - result.nfit if statistic["name"] in ("chi2", "binned_nll") else np.nan)
+        nbins = int(statistic["nbins"]) if statistic["name"] == "binned_nll" else self.nbins
+        counts, edges = np.histogram(data_np, bins=nbins, range=xr)
+        expected = timing_bin_expectations(edges, p, xr)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["poisson_deviance"] = float(2. * np.sum(
+                expected - counts + xlogy(counts, counts) - xlogy(counts, expected)))
+        out["diagnostic_ndf"] = nbins - result.nfit
 
         def model(x):
             return timing_density(x, p, xr) / (p["sig_yield"] + p.get("bkg_yield", 0.))
 
         # Preserve the legacy full-model FWHM, including background.
         out["FWHM"] = self._compute_fwhm(model, xr)
-        self._make_plot(model, data_np, xr, size, out, request.plotname)
+        self._make_plot(p, data_np, xr, out, request.plotname)
         return out
 
     def _attach_main_fit_fields(self, row, fit_out):
