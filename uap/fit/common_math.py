@@ -4,7 +4,7 @@ import logging
 
 import numpy as np
 from iminuit import Minuit
-from scipy.special import ndtr
+from scipy.special import ndtr, xlogy
 
 
 _logger = logging.getLogger(__name__)
@@ -32,11 +32,13 @@ def extended_nll(expected, density, counts=None):
 
 
 def build_objective(data, limits, names, density, integral, statistic, priors=None,
-                    bin_prediction=None):
+                    bin_prediction=None, bin_integral=None):
     """Compose a data cost and Gaussian penalties, independently of the model.
 
     density/integral take (x, parameters)/(parameters) in event units. Optional
     bin_prediction preserves an existing bin-height parameterization exactly.
+    bin_integral(edges, parameters) supplies expected counts, including empty
+    bins, for binned_nll. A midpoint approximation is deliberately not used.
     Chi2 uses observed-count variance and excludes empty bins, as before.
     """
     name = statistic["name"]
@@ -46,6 +48,11 @@ def build_objective(data, limits, names, density, integral, statistic, priors=No
         x, counts = (.5 * (edges[1:] + edges[:-1]))[keep], counts[keep].astype(float)
         width = edges[1] - edges[0]
         errordef = 1.0
+    elif name == "binned_nll":
+        if bin_integral is None:
+            raise ValueError("binned_nll requires a model bin_integral")
+        counts, edges = np.histogram(data, bins=int(statistic["nbins"]), range=limits)
+        errordef = .5
     elif name == "unbinned_nll":
         x, counts = np.unique(data, return_counts=True)
         errordef = .5
@@ -60,6 +67,12 @@ def build_objective(data, limits, names, density, integral, statistic, priors=No
             if not np.all(np.isfinite(expected)) or np.any(expected < 0):
                 return np.inf
             value = np.sum((expected - counts) ** 2 / counts)
+        elif name == "binned_nll":
+            expected = np.asarray(bin_integral(edges, parameters))
+            if (expected.shape != counts.shape or not np.all(np.isfinite(expected))
+                    or np.any(expected < 0)):
+                return np.inf
+            value = np.sum(expected - xlogy(counts, expected))
         else:
             value = extended_nll(integral(parameters), density(x, parameters), counts)
         for parameter, (mean, sigma) in (priors or {}).items():
@@ -67,7 +80,7 @@ def build_objective(data, limits, names, density, integral, statistic, priors=No
         return float(value)
 
     cost.errordef = errordef
-    cost.ndata = len(x) if name == "chi2" else len(data)
+    cost.ndata = len(counts) if name in ("chi2", "binned_nll") else len(data)
     return cost
 
 

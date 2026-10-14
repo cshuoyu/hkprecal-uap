@@ -1,0 +1,9 @@
+# Integer-sample timing: fit expected counts integrated over 2 ns bins.
+defaults:
+  - timing_default
+  - _self_
+
+fit:
+  statistic:
+    name: binned_nll
+    nbins: 30
