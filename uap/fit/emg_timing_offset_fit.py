@@ -662,7 +662,7 @@ class TimingEMGFitter(fitter_interface.BaseScanFitter):
         # Keep only files containing the requested serial block.
         selected = []
         for fp in files:
-            parsed = kor_reader.extract_serial_block_angles(fp.name, args.serial)
+            parsed = kor_reader.extract_serial_block_angles(fp, args.serial)
             if parsed is None:
                 continue
             phi, theta_raw = parsed
