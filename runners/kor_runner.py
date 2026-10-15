@@ -64,18 +64,14 @@ def main():
     default_macro = Path(
         os.environ.get("KOR_PROD_MACRO", str(default_kor_home / "prod_ntp_standalone.C"))
     ).resolve()
-    default_root_base = Path(
-        os.environ.get("UAP_KOR_ROOT_DIR", str(repo_root.parent / "datastorage" / "kor" / "root"))
-    ).resolve()
     default_root_cmd = os.environ.get("ROOT_CMD", "root")
 
     ap = argparse.ArgumentParser(description="Run KOR prod_ntp over all raw ROOT files in one folder.")
     ap.add_argument("--raw-dir", required=True, help="Folder containing raw KOR .root files")
-    ap.add_argument("--out-root-base", default=str(default_root_base), help="Base output dir for KOR roots/logs")
     ap.add_argument(
         "--out-dir",
-        default="",
-        help="Exact output directory for this raw-dir run (contains logs/outputs). Overrides --out-root-base.",
+        required=True,
+        help="Output directory for this run (contains logs/outputs)",
     )
     ap.add_argument("--kor-home", default=str(default_kor_home), help="kor_ntp directory")
     ap.add_argument("--macro", default=str(default_macro), help="prod_ntp_standalone.C path")
@@ -87,7 +83,6 @@ def main():
     args = ap.parse_args()
 
     raw_dir = Path(args.raw_dir).resolve()
-    out_root_base = Path(args.out_root_base).resolve()
     kor_home = Path(args.kor_home).resolve()
     macro = Path(args.macro).resolve()
 
@@ -114,8 +109,7 @@ def main():
         print(f"[WARN] No matching input .root files in {raw_dir}")
         return
 
-    run_name = raw_dir.name
-    run_base = Path(args.out_dir).resolve() if args.out_dir else (out_root_base / run_name)
+    run_base = Path(args.out_dir).resolve()
     log_dir = run_base / "logs"
     out_dir = run_base / "outputs"
     log_dir.mkdir(parents=True, exist_ok=True)
